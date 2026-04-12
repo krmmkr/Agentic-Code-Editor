@@ -1,0 +1,503 @@
+'use client';
+
+import { useState, useRef, useEffect } from 'react';
+import {
+  Send,
+  Trash2,
+  Bot,
+  User,
+  Sparkles,
+  Code2,
+  ChevronDown,
+  ChevronRight,
+  Check,
+  FileCode,
+  Search,
+  Wifi,
+  WifiOff,
+  Plug,
+  Settings,
+  Cpu,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+} from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import { fetchApi } from '@/lib/api-client';
+import { useEditor, type ChatMessage, type DiffChange } from '@/store/editor';
+import { useAgent } from '@/store/agent';
+import PlanCard from './plan-card';
+import { Button } from '@/components/ui/button';
+
+// ── Activity Log Item ────────────────────────────────────
+
+function ActivityItem({ item }: { item: { id: string; content: string; timestamp: number; isStatus?: boolean } }) {
+  const isStatus = item.isStatus;
+
+  if (isStatus) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground">
+        <div className="h-1 w-1 rounded-full bg-muted-foreground/40 shrink-0" />
+        <span className="truncate">{item.content}</span>
+        <span className="shrink-0 opacity-50">
+          {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+        </span>
+      </div>
+    );
+  }
+
+  // User messages
+  return (
+    <div className="flex gap-2.5 px-3 py-2.5 bg-muted/30">
+      <div className="shrink-0 mt-0.5">
+        <div className="h-6 w-6 rounded-full bg-primary/10 flex items-center justify-center">
+          <User className="h-3.5 w-3.5 text-primary" />
+        </div>
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-0.5">
+          <span className="text-xs font-medium">You</span>
+          <span className="text-[10px] text-muted-foreground">
+            {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </span>
+        </div>
+        <p className="text-sm">{item.content}</p>
+      </div>
+    </div>
+  );
+}
+
+// ── Change Review Item ──────────────────────────────────
+
+function ChangeReviewItem({ change }: { change: DiffChange }) {
+  const { setDiffView } = useEditor();
+  const { acceptChange, rejectChange } = useAgent();
+
+  return (
+    <div className="mx-3 my-1.5 rounded-lg border border-border/50 bg-background overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2">
+        <button
+          className="flex items-center gap-2 text-xs hover:text-foreground text-foreground/80 transition-colors"
+          onClick={() => setDiffView(change)}
+        >
+          <Code2 className="h-3.5 w-3.5 text-orange-400" />
+          <span className="font-mono">{change.path}</span>
+        </button>
+        <div className="flex items-center gap-1">
+          {change.accepted && (
+            <span className="flex items-center gap-0.5 text-[10px] text-emerald-500 px-1.5 py-0.5 rounded bg-emerald-500/10">
+              <Check className="h-3 w-3" /> Accepted
+            </span>
+          )}
+          {change.rejected && (
+            <span className="text-[10px] text-destructive px-1.5 py-0.5 rounded bg-destructive/10">
+              Rejected
+            </span>
+          )}
+          {!change.accepted && !change.rejected && (
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 text-[10px] px-2 text-emerald-500 hover:text-emerald-400 hover:bg-emerald-500/10"
+                onClick={() => acceptChange(change.id)}
+              >
+                <Check className="h-3 w-3 mr-0.5" /> Accept
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 text-[10px] px-2 text-destructive hover:text-destructive hover:bg-destructive/10"
+                onClick={() => rejectChange(change.id)}
+              >
+                Reject
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+      {change.description && (
+        <div className="px-3 pb-2 text-[10px] text-muted-foreground">
+          {change.description}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main Chat Panel ─────────────────────────────────────
+
+export default function ChatPanel() {
+  const {
+    agentState,
+    currentPlan,
+    activityLog,
+    isConnected,
+    connect,
+    approvePlan,
+    rejectPlan,
+    sendChat,
+    clearActivity,
+    currentThought,
+  } = useAgent();
+  const { pendingChanges } = useEditor();
+  const [input, setInput] = useState('');
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const [showConnection, setShowConnection] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const { llmSettings, setLLMSettings } = useEditor();
+  const [verifyStatus, setVerifyStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+
+  const handleVerify = async () => {
+    setVerifyStatus('loading');
+    setVerifyError(null);
+    try {
+      const result = await fetchApi<{ success: boolean; error?: string }>('/llm/verify', {
+        method: 'POST',
+        body: JSON.stringify(llmSettings),
+      });
+      if (result.success) {
+        setVerifyStatus('success');
+      } else {
+        setVerifyStatus('error');
+        setVerifyError(result.error || 'Connection failed');
+      }
+    } catch (err) {
+      setVerifyStatus('error');
+      setVerifyError('Request failed');
+    }
+  };
+
+  // Manual connect only.
+
+  // Auto-scroll to bottom on new activity
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [activityLog, currentPlan, pendingChanges, currentThought]);
+
+  const isAgentActive = ['analyzing', 'planning', 'implementing'].includes(agentState);
+  const isWaitingApproval = ['awaiting_plan_approval', 'awaiting_change_approval'].includes(agentState);
+
+  const handleSend = () => {
+    const trimmed = input.trim();
+    if (!trimmed || isAgentActive) return;
+    sendChat(trimmed);
+    setInput('');
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const unresolvedChanges = pendingChanges.filter(c => !c.accepted && !c.rejected);
+
+  return (
+    <div className="h-full flex flex-col bg-background">
+      {/* Header */}
+      <div className="flex items-center justify-between px-3 py-2 border-b shrink-0">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4 text-emerald-500" />
+          <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Agent Chat
+          </span>
+          {unresolvedChanges.length > 0 && (
+            <span className="px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-orange-500/10 text-orange-500">
+              {unresolvedChanges.length} pending
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-0.5">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={() => {
+              const newState = !showSettings;
+              setShowSettings(newState);
+              setShowConnection(newState);
+            }}
+            title="Agent Configuration"
+          >
+            <Settings className={`h-3.5 w-3.5 ${showSettings ? 'text-primary' : ''}`} />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={clearActivity}
+            title="Clear conversation"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      </div>
+
+      {/* LLM Settings banner */}
+      {showSettings && (
+        <div className="px-3 py-3 border-b shrink-0 bg-muted/40 space-y-3">
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              LiteLLM API Key
+            </label>
+            <input
+              type="password"
+              value={llmSettings.apiKey}
+              onChange={(e) => setLLMSettings({ ...llmSettings, apiKey: e.target.value })}
+              placeholder="Leave empty to use server .env"
+              className="w-full text-xs px-2 py-1.5 rounded border bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Model Override
+            </label>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={llmSettings.model}
+                onChange={(e) => setLLMSettings({ ...llmSettings, model: e.target.value })}
+                placeholder="e.g. gemini/gemini-2.0-flash"
+                className="flex-1 text-xs px-2 py-1.5 rounded border bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+              <Button 
+                variant="outline" 
+                size="sm" 
+                className="h-8 text-[10px]"
+                onClick={() => setLLMSettings({ ...llmSettings, model: 'gemini/gemini-2.0-flash' })}
+              >
+                Reset
+              </Button>
+            </div>
+          </div>
+          <p className="text-[9px] text-muted-foreground leading-tight">
+            Settings are saved locally.
+          </p>
+
+          <div className="flex items-center justify-between gap-4 pt-1 border-t border-border/20 mt-1">
+            <Button 
+              variant="outline" 
+              size="sm" 
+              className={`h-7 px-2 gap-1.5 text-[10px] ${
+                verifyStatus === 'success' ? 'text-emerald-500 border-emerald-500/50 bg-emerald-500/5' :
+                verifyStatus === 'error' ? 'text-destructive border-destructive/50 bg-destructive/5' : ''
+              }`}
+              onClick={handleVerify}
+              disabled={verifyStatus === 'loading'}
+            >
+              {verifyStatus === 'loading' ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : verifyStatus === 'success' ? (
+                <CheckCircle2 className="h-3 w-3" />
+              ) : verifyStatus === 'error' ? (
+                <AlertCircle className="h-3 w-3" />
+              ) : (
+                <Cpu className="h-3 w-3" />
+              )}
+              {verifyStatus === 'loading' ? 'Verifying...' : 
+               verifyStatus === 'success' ? 'Connected' : 
+               verifyStatus === 'error' ? 'Failed' : 'Verify Connection'}
+            </Button>
+            
+            {verifyError && (
+              <span className="text-[9px] text-destructive truncate max-w-[150px] italic" title={verifyError}>
+                {verifyError}
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Connection status & Mode banner */}
+      {showConnection && (
+        <div className="px-3 py-3 border-b shrink-0 bg-muted/30 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs">
+              <Plug className="h-3.5 w-3.5 text-muted-foreground" />
+              <div className="flex items-center gap-1.5">
+                <span className={`h-1.5 w-1.5 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-destructive'}`} />
+                <span className="font-medium">
+                  {isConnected ? 'Connected' : 'Disconnected'}
+                </span>
+              </div>
+            </div>
+            <Button
+              variant={isConnected ? "destructive" : "default"}
+              size="sm"
+              className="h-7 text-[10px] px-3"
+              onClick={() => isConnected ? useAgent.getState().disconnect() : connect()}
+            >
+              {isConnected ? 'Disconnect' : 'Connect'}
+            </Button>
+          </div>
+
+        </div>
+      )}
+
+      {/* Activity Feed + Plan + Changes */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto">
+        {activityLog.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full px-6 text-center text-muted-foreground">
+            <div className="h-10 w-10 rounded-full bg-emerald-500/10 flex items-center justify-center mb-3">
+              <Bot className="h-5 w-5 text-emerald-500" />
+            </div>
+            <p className="text-sm font-medium mb-1">Agent Assistant</p>
+            <p className="text-xs leading-relaxed mb-3">
+              {isConnected
+                ? 'Ask me to write, edit, or debug code. I\'ll analyze first, then propose a plan for your approval.'
+                : 'Connect to the agent backend to start coding with AI assistance.'}
+            </p>
+            <div className="mt-1 space-y-1.5 w-full">
+              {[
+                'Add a health check endpoint',
+                'Refactor the config module',
+                'Fix error handling in main.py',
+              ].map((suggestion, i) => (
+                <button
+                  key={i}
+                  className="w-full text-left text-xs px-3 py-2 rounded-md bg-accent/50 hover:bg-accent transition-colors"
+                  onClick={() => {
+                    setInput(suggestion);
+                    inputRef.current?.focus();
+                  }}
+                >
+                  &ldquo;{suggestion}&rdquo;
+                </button>
+              ))}
+            </div>
+            {/* Workflow explanation */}
+            <div className="mt-6 w-full text-left space-y-2">
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                How it works
+              </p>
+              <div className="space-y-1.5 text-[10px]">
+                {[
+                  { icon: Search, text: 'Agent analyzes your codebase', color: 'text-blue-400' },
+                  { icon: Sparkles, text: 'Agent proposes an implementation plan', color: 'text-yellow-400' },
+                  { icon: Check, text: 'You approve or reject the plan', color: 'text-emerald-400' },
+                  { icon: Code2, text: 'Agent implements the approved changes', color: 'text-orange-400' },
+                  { icon: Check, text: 'You review and accept/reject each change', color: 'text-emerald-400' },
+                ].map((step, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <step.icon className={`h-3 w-3 ${step.color}`} />
+                    <span className="text-muted-foreground">{step.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="divide-y divide-border/20">
+            {activityLog.map(item => (
+              <ActivityItem key={item.id} item={item} />
+            ))}
+
+            {/* Plan card */}
+            {currentPlan && (
+              <div className="px-3 py-2">
+                <PlanCard
+                  plan={currentPlan}
+                  onApprove={approvePlan}
+                  onReject={rejectPlan}
+                />
+              </div>
+            )}
+
+            {/* Pending changes */}
+            {unresolvedChanges.length > 0 && (
+              <div className="px-3 py-2 space-y-1.5">
+                <div className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  <Code2 className="h-3 w-3" />
+                  Proposed Changes ({unresolvedChanges.length})
+                </div>
+                {unresolvedChanges.map(change => (
+                  <ChangeReviewItem key={change.id} change={change} />
+                ))}
+              </div>
+            )}
+
+            {/* Accepted/rejected changes summary */}
+            {pendingChanges.length > 0 && pendingChanges.every(c => c.accepted || c.rejected) && (
+              <div className="px-3 py-1.5">
+                <div className="text-[10px] text-muted-foreground">
+                  {pendingChanges.filter(c => c.accepted).length} accepted ·{' '}
+                  {pendingChanges.filter(c => c.rejected).length} rejected
+                </div>
+              </div>
+            )}
+
+            {/* Live Thinking / Reasoning Block */}
+            {currentThought && (
+              <div className="mx-3 my-2 p-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 space-y-2 animate-in fade-in slide-in-from-bottom-2 duration-300">
+                <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
+                  <div className="h-4 w-4 rounded-full bg-emerald-500/20 flex items-center justify-center">
+                    <Cpu className="h-2.5 w-2.5 animate-pulse" />
+                  </div>
+                  Reasoning
+                </div>
+                <div className="text-xs leading-relaxed text-foreground/90 font-medium">
+                  <ReactMarkdown>{currentThought}</ReactMarkdown>
+                </div>
+              </div>
+            )}
+
+            {/* Thinking indicator */}
+            {isAgentActive && (
+              <div className="flex items-center gap-2 px-3 py-3">
+                <Bot className="h-4 w-4 text-emerald-500 animate-pulse" />
+                <div className="flex gap-1">
+                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-bounce" style={{ animationDelay: '300ms' }} />
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Input area */}
+      <div className="border-t p-3 shrink-0">
+        <div className="flex gap-2 items-end">
+          <textarea
+            ref={inputRef}
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder={
+              isAgentActive ? 'Agent is working...' :
+              isWaitingApproval ? 'Waiting for approval...' :
+              'Ask the agent...'
+            }
+            disabled={isAgentActive || isWaitingApproval}
+            rows={1}
+            className="flex-1 resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring min-h-[36px] max-h-[120px] disabled:opacity-50 disabled:cursor-not-allowed"
+            style={{
+              height: 'auto',
+              overflow: input.includes('\n') ? 'auto' : 'hidden',
+            }}
+            onInput={e => {
+              const target = e.target as HTMLTextAreaElement;
+              target.style.height = 'auto';
+              target.style.height = Math.min(target.scrollHeight, 120) + 'px';
+            }}
+          />
+          <Button
+            size="icon"
+            className="h-9 w-9 shrink-0"
+            onClick={handleSend}
+            disabled={!input.trim() || isAgentActive || isWaitingApproval}
+          >
+            <Send className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-code-editor"
+version = "0.1.0"
+description = "FastAPI + Socket.IO + LiteLLM backend for the agentic code editor with human-in-the-loop AI workflow"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Agentic Code Editor Team"},
+]
+keywords = ["ai", "code-editor", "agent", "llm", "fastapi", "socketio"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+]
+
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-socketio>=5.11.0",
+    "python-engineio>=4.9.0",
+    "websockets>=12.0",
+    "litellm>=1.0.0",
+    "google-adk>=0.1.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "httpx>=0.24",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+agentic-editor = "agentic_code_editor.main:run_server"
+
+[tool.setuptools.packages.find]
+include = ["agentic_code_editor*"]
+
+[tool.setuptools.package-data]
+agentic_code_editor = ["static/**"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
