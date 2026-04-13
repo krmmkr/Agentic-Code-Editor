@@ -49,6 +49,7 @@ from .protocol import (
     TerminalOutputPayload,
 )
 from . import tools
+from .database import update_session_state, get_messages, update_message_record, get_setting
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,6 @@ class CodeAgent:
     """
 
     def __init__(self) -> None:
-        from .database import get_setting
         self._cancelled = False
         self._llm_settings: dict[str, str] = {}
         
@@ -281,6 +281,8 @@ class CodeAgent:
 
         try:
             # 0. CHECK FOR RESUMPTION
+            file_contents = {}
+            repo_context = ""
             resumable_plan = None
             is_continuation = any(word in user_message.lower() for word in ["continue", "resume", "go on", "keep going"])
             is_generic_msg = not user_message or any(word == user_message.lower().strip() for word in ["hello", "hi", "hey", "ping"])
@@ -942,9 +944,12 @@ class CodeAgent:
                 self._pending_changes.append(change_payload)
                 
                 # Sync to database
-                from .database import update_session_state
                 if session_id := getattr(self, "_current_session_id", None):
                    update_session_state(session_id, pending_changes=self._pending_changes)
+                   # Force sync to UI
+                   yield AgentEvent.build("session_state", {
+                       "pending_changes": self._pending_changes
+                   })
 
                 yield AgentEvent.build("file_change", change_payload)
 
@@ -969,9 +974,12 @@ class CodeAgent:
 
                 # Remove from pending changes and sync to DB
                 self._pending_changes = [c for c in self._pending_changes if c["id"] != change_id]
-                from .database import update_session_state
                 if session_id := getattr(self, "_current_session_id", None):
                     update_session_state(session_id, pending_changes=self._pending_changes)
+                    # Force sync to UI
+                    yield AgentEvent.build("session_state", {
+                        "pending_changes": self._pending_changes
+                    })
         else:
             # Generic step
             await asyncio.sleep(0.3)
@@ -1195,7 +1203,6 @@ class CodeAgent:
         """Phase 3: Wait for user review and approval."""
         yield AgentEvent.build("plan", plan)
         if self._current_session_id:
-            from .database import update_session_state
             update_session_state(self._current_session_id, current_plan=plan)
         
         # Write files for user to review in their own editor
@@ -1211,6 +1218,22 @@ class CodeAgent:
         yield AgentEvent.build("file_read", {"path": "implementation_plan.md", "reason": "Please review and approve the plan"})
         
         self._last_approval = await self._wait_for_approval(wait_for_command, "approve_plan", "reject_plan", expected_id=plan.get("id"))
+        
+        # Persist the decision in the historical record
+        if self._current_session_id:
+            try:
+                # Find the most recent assistant message with this plan ID in payload
+                msgs = get_messages(self._current_session_id)
+                for m in reversed(msgs):
+                    if m.role == 'assistant' and m.payload:
+                        payload_data = json.loads(m.payload)
+                        if payload_data.get('id') == plan.get('id'):
+                            # Update found message
+                            payload_data['status'] = 'approved' if self._last_approval else 'rejected'
+                            update_message_record(m.id, payload=payload_data)
+                            break
+            except Exception as e:
+                logger.error(f"Failed to update historical plan message: {e}")
 
     async def _sync_approved_plan(self, original_plan: dict, approval_cmd: dict):
         """Merge potential manual edits from the user into the execution plan."""
@@ -1246,7 +1269,6 @@ class CodeAgent:
         })
         self._last_plan = original_plan
         if self._current_session_id:
-            from .database import update_session_state
             update_session_state(self._current_session_id, current_plan=original_plan)
 
     async def _run_implementation_phase(self, plan: dict, wait_for_command, file_contents: dict):
@@ -1268,7 +1290,6 @@ class CodeAgent:
             # Update step status in the plan object
             step["status"] = "running"
             if self._current_session_id:
-                from .database import update_session_state
                 update_session_state(self._current_session_id, current_plan=plan)
 
             yield AgentEvent.build("step_update", {
@@ -1288,7 +1309,6 @@ class CodeAgent:
                 # Step finished
                 step["status"] = "completed"
                 if self._current_session_id:
-                    from .database import update_session_state
                     update_session_state(self._current_session_id, current_plan=plan)
 
                 yield AgentEvent.build("step_update", {

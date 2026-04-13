@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentic-code-editor"
-version = "0.1.0"
+version = "0.1.1"
 description = "FastAPI + Socket.IO + LiteLLM backend for the agentic code editor with human-in-the-loop AI workflow"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Agentic Code Editor Team"},
+    {name = "Kohul", email = "kohul1993@gmail.com"},
 ]
 keywords = ["ai", "code-editor", "agent", "llm", "fastapi", "socketio"]
 classifiers = [
@@ -45,6 +45,11 @@ dev = [
     "httpx>=0.24",
     "ruff>=0.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/krmmkr/Agentic-Code-Editor"
+Repository = "https://github.com/krmmkr/Agentic-Code-Editor"
+Issues = "https://github.com/krmmkr/Agentic-Code-Editor/issues"
 
 [project.scripts]
 agentic-editor = "agentic_code_editor.main:run_server"

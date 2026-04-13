@@ -251,6 +251,20 @@ def get_messages(session_id: str) -> List[Message]:
         statement = select(Message).where(Message.session_id == session_id).order_by(Message.timestamp.asc())
         return session.exec(statement).all()
 
+def update_message_record(message_id: int, payload: any = None, content: str = None) -> Optional[Message]:
+    with Session(engine) as session:
+        db_message = session.get(Message, message_id)
+        if db_message:
+            if payload is not None:
+                db_message.payload = json.dumps(payload)
+            if content is not None:
+                db_message.content = content
+            session.add(db_message)
+            session.commit()
+            session.refresh(db_message)
+            return db_message
+    return None
+
 def set_setting(key: str, value: any):
     with Session(engine) as session:
         db_setting = session.get(Setting, key)
