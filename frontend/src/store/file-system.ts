@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import { fetchApi } from '@/lib/api-client';
+import { useEditor } from './editor';
 
 export interface FileNode {
   id: string;
@@ -143,6 +144,11 @@ export const useFileSystem = create<FileSystemState>()(
 
           migrateContent(newFiles);
           set({ files: newFiles });
+          
+          // Sync open tabs with the new file tree
+          const allFilePaths = collectFiles(newFiles).map(f => f.path);
+          useEditor.getState().validateTabs(allFilePaths);
+
           get().fetchGitStatus();
         } catch (err) {
           console.error('Failed to fetch file tree:', err);

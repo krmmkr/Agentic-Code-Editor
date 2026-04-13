@@ -16,8 +16,10 @@ A next-generation, agentic code editor featuring a **Human-in-the-Loop AI workfl
 
 ```text
 .
-├── frontend/           # Next.js + Tailwind + Lucide UI
-├── backend/            # FastAPI + Socket.IO + LiteLLM orchestrator
+├── agentic_code_editor/ # Core Python package (Backend & Agent)
+├── frontend/           # Next.js + Tailwind UI (Source)
+├── pyproject.toml      # Packaging metadata
+├── bundle.sh           # Unified build script
 └── workspace/          # Default directory for agent operations
 ```
 
@@ -32,11 +34,10 @@ A next-generation, agentic code editor featuring a **Human-in-the-Loop AI workfl
 ### Backend Installation
 
 ```bash
-cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env  # Add your API keys
+# Add your API keys to .env
 python -m agentic_code_editor.main
 ```
 
@@ -50,14 +51,17 @@ npm run dev
 
 The app will be available at `http://localhost:3000`.
 
-## 📦 Publishing as a Package
-
-The backend can be published as a standalone Python package. See [PUBLISHING.md](PUBLISHING.md) for detailed instructions.
+## 📦 Package
 
 ```bash
 pip install agentic-code-editor
+agentic-editor
 ```
+
+## 📚 Documentation
+
+- [Embedding & Integration Guide](docs/EMBEDDING_GUIDE.md) — Learn how to embed the editor in your own Flask or FastAPI applications.
 
 ## 📄 License
 
-MIT © [Your Name/Team]
+MIT © Kohul

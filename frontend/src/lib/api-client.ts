@@ -157,7 +157,7 @@ export type AgentState =
 // ── Frontend → Backend Commands ──────────────────────────
 
 export type ClientCommand =
-  | { type: 'chat'; payload: { message: string; llm_settings?: { api_key?: string; model?: string } } }
+  | { type: 'chat'; payload: { message: string; session_id?: string | null; llm_settings?: { api_key?: string; model?: string } } }
   | { type: 'approve_plan'; payload: { plan_id: string; plan?: any; plan_md?: string; task_md?: string } }
   | { type: 'reject_plan'; payload: { plan_id: string; reason?: string } }
   | { type: 'accept_change'; payload: { change_id: string } }

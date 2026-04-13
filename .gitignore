@@ -46,6 +46,5 @@ Thumbs.db
 
 # Project Specific
 workspace/
-backend/workspace/
 frontend/.env
-backend/.env
+.env

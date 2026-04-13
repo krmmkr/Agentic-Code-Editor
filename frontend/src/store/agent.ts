@@ -11,6 +11,7 @@ import type {
   AgentTerminalOutputEvent,
   AgentStepUpdateEvent,
 } from '@/lib/api-client';
+import { fetchApi } from '@/lib/api-client';
 export type { AgentState };
 import { useEditor, type DiffChange } from '@/store/editor';
 import { useFileSystem } from '@/store/file-system';
@@ -61,6 +62,8 @@ export interface AgentMessage {
   content: string;
   timestamp: number;
   isStatus?: boolean;
+  role?: 'user' | 'assistant';
+  payload?: any;
 }
 
 // ── Store ────────────────────────────────────────────────
@@ -102,16 +105,34 @@ interface AgentStore {
   // Terminal toggle
   toggleTerminal: () => void;
 
+  // Sessions
+  sessions: any[];
+  currentSessionId: string | null;
+  loadSession: (sessionId: string) => Promise<void>;
+  createSession: (title: string) => Promise<void>;
+  deleteSession: (sessionId: string) => Promise<void>;
+
   // Internal
   sendCommand: (command: ClientCommand) => void;
-  handleEvent: (event: AgentEvent) => void;
-  addActivity: (content: string, isStatus?: boolean) => void;
+  handleEvent: (event: AgentEvent) => Promise<void>;
+  addActivity: (content: string, isStatus?: boolean, role?: 'user' | 'assistant', payload?: any) => void;
   clearActivity: () => void;
+  resetAll: () => Promise<void>;
+  
+  // Status
+  isInitializing: boolean;
+  isConnecting: boolean;
+  isCreatingSession: boolean;
+  sessionsLoaded: boolean;
 }
 
 export const useAgent = create<AgentStore>((set, get) => ({
   socket: null,
   isConnected: false,
+  isInitializing: false,
+  isConnecting: false,
+  isCreatingSession: false,
+  sessionsLoaded: false,
   agentState: 'idle',
   statusDetail: '',
   currentPlan: null,
@@ -122,7 +143,10 @@ export const useAgent = create<AgentStore>((set, get) => ({
   currentThought: null,
 
   connect: () => {
-    const { socket } = get();
+    const { socket, isConnecting } = get();
+    if (isConnecting) return;
+    set({ isConnecting: true });
+
     if (socket?.connected) {
       socket.disconnect();
     }
@@ -142,13 +166,55 @@ export const useAgent = create<AgentStore>((set, get) => ({
       forceNew: true,
     });
 
-    newSocket.on('connect', () => {
+    newSocket.on('connect', async () => {
       set({ isConnected: true, agentState: 'idle', statusDetail: '' });
       get().addActivity(`Connected to ${modeLabel}`, true);
+
+      // Prevent concurrent initialization
+      if (get().isInitializing) return;
+      set({ isInitializing: true });
+
+      // Fetch persistent sessions
+      try {
+        set({ sessionsLoaded: false });
+        
+        // Wait specifically for FileSystem to be loaded
+        let retries = 0;
+        while (!useFileSystem.getState().isLoaded && retries < 20) {
+          await new Promise(r => setTimeout(r, 200));
+          retries++;
+        }
+
+        const workspacePath = useFileSystem.getState().currentWorkspacePath;
+        if (!workspacePath) {
+           console.warn('Workspace path not available during initialization.');
+           return;
+        }
+
+        const sessions = await fetchApi<any[]>(`/sessions?workspace=${encodeURIComponent(workspacePath)}`);
+        set({ sessions, sessionsLoaded: true });
+        
+        // Auto-load latest session or create new
+        const savedSessionId = window.localStorage.getItem('current_session_id');
+        const sessionExists = sessions.find(s => s.id === savedSessionId);
+        
+        if (sessionExists && sessionExists.workspace_path === workspacePath) {
+          await get().loadSession(savedSessionId!);
+        } else if (sessions.length > 0) {
+          await get().loadSession(sessions[0].id);
+        } else {
+          // Create initial session if really empty for this workspace
+          await get().createSession('Session 1');
+        }
+      } catch (err) {
+        console.error('Failed to restore persistent session:', err);
+      } finally {
+        set({ isInitializing: false, isConnecting: false });
+      }
     });
 
     newSocket.on('connect_error', (err) => {
-      set({ isConnected: false, agentState: 'idle', statusDetail: '' });
+      set({ isConnected: false, isConnecting: false, agentState: 'idle', statusDetail: '' });
       get().addActivity(`Failed to connect to ${modeLabel}: ${err.message}`, true);
       alert(`Connection Error: Could not reach the ${modeLabel} on ${socketUrl}. Make sure the backend is running.`);
     });
@@ -173,8 +239,8 @@ export const useAgent = create<AgentStore>((set, get) => ({
     });
 
     // The unified event channel
-    newSocket.on('agent:event', (event: AgentEvent) => {
-      get().handleEvent(event);
+    newSocket.on('agent:event', async (event: AgentEvent) => {
+      await get().handleEvent(event);
     });
 
     set({ socket: newSocket });
@@ -262,7 +328,20 @@ export const useAgent = create<AgentStore>((set, get) => ({
     // 1. Log visually immediately
     get().addActivity(message);
 
-    // 2. Clear stale thoughts from previous runs
+    // 2. Save to DB
+    try {
+      const { currentSessionId } = get();
+      if (currentSessionId) {
+        await fetchApi('/messages', {
+          method: 'POST',
+          body: JSON.stringify({ session_id: currentSessionId, role: 'user', content: message })
+        });
+      }
+    } catch (err) {
+      console.warn('Failed to persist user message:', err);
+    }
+
+    // 3. Clear stale thoughts from previous runs
     set({ currentThought: null });
 
     // 3. Auto-reconnect if needed
@@ -284,6 +363,7 @@ export const useAgent = create<AgentStore>((set, get) => ({
       type: 'chat', 
       payload: { 
         message,
+        session_id: get().currentSessionId,
         llm_settings: {
           api_key: llmSettings.apiKey,
           model: llmSettings.model
@@ -346,8 +426,8 @@ export const useAgent = create<AgentStore>((set, get) => ({
   },
 
   toggleTerminal: () => set(s => ({ showTerminal: !s.showTerminal })),
-
-  handleEvent: (event: AgentEvent) => {
+  
+  handleEvent: async (event: AgentEvent) => {
     const { type, payload } = event;
 
     switch (type) {
@@ -356,6 +436,12 @@ export const useAgent = create<AgentStore>((set, get) => ({
         const oldState = get().agentState;
         set({ agentState: state, statusDetail: detail || '' });
         if (detail) get().addActivity(detail, true);
+        
+        // Proactive file refresh if agent idles or completes
+        if (state === 'idle' || state === 'complete') {
+          import('./file-system').then(m => m.useFileSystem.getState().refresh());
+        }
+
         if (state !== oldState || state === 'idle' || state === 'complete' || state === 'error') {
           // Clear current thought whenever a new phase starts
           set({ currentThought: null });
@@ -382,7 +468,20 @@ export const useAgent = create<AgentStore>((set, get) => ({
 
       case 'message': {
         const { content } = payload as { content: string };
-        get().addActivity(content);
+        get().addActivity(content, false, 'assistant');
+        
+        // Save assistant message to DB
+        try {
+          const { currentSessionId } = get();
+          if (currentSessionId) {
+            await fetchApi('/messages', {
+              method: 'POST',
+              body: JSON.stringify({ session_id: currentSessionId, role: 'assistant', content })
+            });
+          }
+        } catch (err) {
+          console.warn('Failed to persist assistant message:', err);
+        }
         break;
       }
 
@@ -410,6 +509,27 @@ export const useAgent = create<AgentStore>((set, get) => ({
           for (const filePath of step.files) {
             fs.expandPath(filePath);
           }
+        }
+        
+        const content = `Proposed a plan with ${plan.steps.length} steps`;
+        get().addActivity(content, true, 'assistant', plan);
+
+        // Save plan message to DB
+        try {
+          const { currentSessionId } = get();
+          if (currentSessionId) {
+            await fetchApi('/messages', {
+              method: 'POST',
+              body: JSON.stringify({ 
+                session_id: currentSessionId, 
+                role: 'assistant', 
+                content,
+                payload: plan 
+              })
+            });
+          }
+        } catch (err) {
+          console.warn('Failed to persist plan message:', err);
         }
         // Open plan as a tab in the editor
         useEditor.getState().openPlanTab();
@@ -539,21 +659,152 @@ export const useAgent = create<AgentStore>((set, get) => ({
     }
   },
 
-  addActivity: (content: string, isStatus = false) => {
-    set(s => ({
+  addActivity: (content, isStatus, role, payload) =>
+    set(state => ({
       activityLog: [
-        ...s.activityLog,
-        { id: crypto.randomUUID(), content, timestamp: Date.now(), isStatus },
+        ...state.activityLog,
+        {
+          id: crypto.randomUUID(),
+          content,
+          timestamp: Date.now(),
+          isStatus,
+          role: role || (isStatus ? undefined : 'user'),
+          payload,
+        },
       ],
-    }));
-  },
+    })),
 
-  clearActivity: () => set({
+  clearActivity: () => set({ 
     activityLog: [],
     currentPlan: null,
     readFiles: [],
     terminalCommands: [],
-    agentState: 'idle',
-    currentThought: null,
+    agentState: 'idle' as const,
+    currentThought: null
   }),
+
+  // ---------------------------------------------------------
+  // Sessions
+  // ---------------------------------------------------------
+
+  sessions: [],
+  currentSessionId: null,
+
+  loadSession: async (sessionId: string) => {
+    try {
+      set({ currentSessionId: sessionId });
+      window.localStorage.setItem('current_session_id', sessionId);
+
+      const [sessionData, messages] = await Promise.all([
+        fetchApi<any>(`/sessions/${sessionId}`),
+        fetchApi<any[]>(`/sessions/${sessionId}/messages`),
+      ]);
+
+      // Update Activity Log and hard-reset operational flags
+      set({
+        currentThought: null,
+        currentPlan: null,
+        terminalCommands: [],
+        readFiles: [],
+        agentState: 'idle' as const,
+        statusDetail: '',
+        activityLog: messages.map(m => ({
+          id: m.id.toString(),
+          role: m.role,
+          content: m.content,
+          timestamp: new Date(m.timestamp).getTime(),
+          isStatus: false,
+          payload: m.payload ? JSON.parse(m.payload) : undefined
+        }))
+      });
+
+      // Active Plan Recovery:
+      // If the last assistant message has a payload that looks like a pending plan, 
+      // restore it to the active state so the user can approve/reject it.
+      const activity = get().activityLog;
+      const lastAssistantMessage = [...activity].reverse().find(m => m.role === 'assistant' && m.payload?.steps);
+      
+      if (lastAssistantMessage && lastAssistantMessage.payload.status === 'pending') {
+        console.log('Restoring active plan from history:', lastAssistantMessage.id);
+        set({ currentPlan: lastAssistantMessage.payload });
+      }
+
+      // Update Editor UI State
+      const openTabs = JSON.parse(sessionData.open_tabs || '[]');
+      const pendingChanges = JSON.parse(sessionData.pending_changes || '[]');
+      
+      useEditor.setState({ 
+        openTabs, 
+        pendingChanges,
+        activeTab: openTabs.length > 0 ? openTabs[0] : null
+      });
+
+    } catch (err) {
+      console.error('Failed to load session:', err);
+    } finally {
+      set({ isInitializing: false, isConnecting: false });
+    }
+  },
+
+  createSession: async (title: string) => {
+    if (get().isCreatingSession) return;
+    set({ isCreatingSession: true });
+
+    try {
+      const workspacePath = useFileSystem.getState().currentWorkspacePath;
+      
+      // Check for name collision locally first
+      const existing = get().sessions.find(s => s.title === title && s.workspace_path === workspacePath);
+      if (existing) {
+        console.warn('Session with this name already exists, switching to it instead of creating duplicate.');
+        await get().loadSession(existing.id);
+        return;
+      }
+
+      const id = crypto.randomUUID();
+      await fetchApi('/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ id, workspace_path: workspacePath, title })
+      });
+      
+      const sessions = await fetchApi<any[]>(`/sessions?workspace=${encodeURIComponent(workspacePath)}`);
+      set({ sessions });
+      await get().loadSession(id);
+    } catch (err) {
+      console.error('Failed to create session:', err);
+    } finally {
+      set({ isCreatingSession: false });
+    }
+  },
+
+  deleteSession: async (sessionId: string) => {
+    try {
+      await fetchApi(`/sessions/${sessionId}`, { method: 'DELETE' });
+      const workspacePath = useFileSystem.getState().currentWorkspacePath;
+      const sessions = await fetchApi<any[]>(`/sessions?workspace=${encodeURIComponent(workspacePath)}`);
+      set({ sessions });
+      
+      if (get().currentSessionId === sessionId) {
+        if (sessions.length > 0) await get().loadSession(sessions[0].id);
+        else await get().createSession('Session 1');
+      }
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+    }
+  },
+
+  resetAll: async () => {
+    try {
+      // 1. Backend Wipe
+      await fetchApi('/database/reset', { method: 'POST' });
+      
+      // 2. Clear LocalStorage
+      window.localStorage.clear();
+      
+      // 3. Page Reload to reset all stores
+      window.location.reload();
+    } catch (err) {
+      console.error('Failed to reset:', err);
+    }
+  }
 }));

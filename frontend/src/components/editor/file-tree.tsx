@@ -406,10 +406,27 @@ export default function FileTree() {
             className="h-6 w-6" 
             onClick={async () => {
               try {
-                await fetchApi('/session/summary', { method: 'POST' });
-                refresh();
+                const fs = useFileSystem.getState();
+                const allFiles = fs.getAllFiles();
+                const changedFiles = allFiles
+                  .filter(f => fs.getFileStatus(f.path) !== 'unchanged')
+                  .map(f => ({ path: f.path, status: fs.getFileStatus(f.path) }));
+
+                const result = await fetchApi<{ success: boolean; message: string }>('/session/summary', { 
+                  method: 'POST',
+                  body: JSON.stringify({ changed_files: changedFiles })
+                });
+                
+                if (result.success) {
+                  alert(`Summary generated: SESSION_SUMMARY.md`);
+                  refresh();
+                  useEditor.getState().openFile('SESSION_SUMMARY.md');
+                } else {
+                  alert(result.message || 'No changes found to summarize');
+                }
               } catch (err) {
                 console.error('Failed to generate summary:', err);
+                alert('Failed to generate summary. See console for details.');
               }
             }}
             title="Generate Session Summary"

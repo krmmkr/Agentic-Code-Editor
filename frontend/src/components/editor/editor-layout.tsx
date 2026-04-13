@@ -38,10 +38,12 @@ import {
 
 export default function EditorLayout() {
   const initFileSystem = useFileSystem(state => state.init);
+  const connectAgent = useAgent(state => state.connect);
   
   useEffect(() => {
     initFileSystem();
-  }, [initFileSystem]);
+    connectAgent();
+  }, [initFileSystem, connectAgent]);
 
   const activeDiff = useEditor(state => state.activeDiff);
   const { activeTab, openTabs, closeTab, closeAllTabs, closeSavedTabs, setActiveTab, pendingChanges } = useEditor();

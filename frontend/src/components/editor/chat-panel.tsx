@@ -20,7 +20,11 @@ import {
   Cpu,
   CheckCircle2,
   AlertCircle,
+  Plus,
+  History,
+  Eraser,
   Loader2,
+  AlertTriangle,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { fetchApi } from '@/lib/api-client';
@@ -31,8 +35,9 @@ import { Button } from '@/components/ui/button';
 
 // ── Activity Log Item ────────────────────────────────────
 
-function ActivityItem({ item }: { item: { id: string; content: string; timestamp: number; isStatus?: boolean } }) {
+function ActivityItem({ item }: { item: { id: string; content: string; timestamp: number; isStatus?: boolean; role?: 'user' | 'assistant'; payload?: any } }) {
   const isStatus = item.isStatus;
+  const isAssistant = item.role === 'assistant';
 
   if (isStatus) {
     return (
@@ -46,22 +51,41 @@ function ActivityItem({ item }: { item: { id: string; content: string; timestamp
     );
   }
 
-  // User messages
   return (
-    <div className="flex gap-2.5 px-3 py-2.5 bg-muted/30">
+    <div className={`flex gap-2.5 px-3 py-2.5 ${isAssistant ? 'bg-background' : 'bg-muted/30'}`}>
       <div className="shrink-0 mt-0.5">
-        <div className="h-6 w-6 rounded-full bg-primary/10 flex items-center justify-center">
-          <User className="h-3.5 w-3.5 text-primary" />
+        <div className={`h-6 w-6 rounded-full flex items-center justify-center ${isAssistant ? 'bg-emerald-500/10' : 'bg-primary/10'}`}>
+          {isAssistant ? (
+            <Bot className="h-3.5 w-3.5 text-emerald-500" />
+          ) : (
+            <User className="h-3.5 w-3.5 text-primary" />
+          )}
         </div>
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-0.5">
-          <span className="text-xs font-medium">You</span>
+          <span className="text-xs font-medium">{isAssistant ? 'Assistant' : 'You'}</span>
           <span className="text-[10px] text-muted-foreground">
             {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           </span>
         </div>
-        <p className="text-sm">{item.content}</p>
+        <div className="text-sm prose prose-sm dark:prose-invert max-w-none">
+          <ReactMarkdown>{item.content}</ReactMarkdown>
+        </div>
+        
+        {/* Historical Plan/Payload Rendering */}
+        {item.payload && item.payload.steps && (
+          <div className="mt-3 border rounded-lg bg-background/50 overflow-hidden">
+            <div className="px-3 py-1.5 bg-muted/30 border-b flex items-center justify-between">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Historical Plan Snapshot
+              </span>
+            </div>
+            <div className="p-2 origin-top scale-[0.9] -m-[5%]">
+              <PlanCard plan={item.payload} />
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -139,6 +163,14 @@ export default function ChatPanel() {
     sendChat,
     clearActivity,
     currentThought,
+    sessions,
+    currentSessionId,
+    loadSession,
+    createSession,
+    deleteSession,
+    resetAll,
+    isCreatingSession,
+    sessionsLoaded,
   } = useAgent();
   const { pendingChanges } = useEditor();
   const [input, setInput] = useState('');
@@ -230,12 +262,63 @@ export default function ChatPanel() {
           <Button
             variant="ghost"
             size="icon"
-            className="h-6 w-6"
+            className="h-6 w-6 text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all"
             onClick={clearActivity}
-            title="Clear conversation"
+            title="Clear current view (Eraser)"
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Eraser className="h-3.5 w-3.5" />
           </Button>
+        </div>
+      </div>
+
+      {/* Session Switcher */}
+      <div className="flex items-center gap-2 px-3 py-1.5 border-b bg-muted/20 shrink-0">
+        <div className="flex-1 flex items-center gap-1.5 overflow-hidden">
+          <select 
+            className="flex-1 bg-background text-foreground text-[10px] font-medium focus:outline-none transition-colors border border-border/50 rounded px-1 h-6 cursor-pointer hover:border-border disabled:opacity-50"
+            value={currentSessionId || ''}
+            onChange={(e) => loadSession(e.target.value)}
+            disabled={!sessionsLoaded}
+          >
+            {!sessionsLoaded ? (
+              <option>Loading sessions...</option>
+            ) : sessions.length === 0 ? (
+              <option>No sessions</option>
+            ) : (
+              sessions.map((s, idx) => (
+                <option key={s.id} value={s.id} className="bg-background text-foreground">
+                  {s.title || `Session ${idx + 1}`}
+                </option>
+              ))
+            )}
+          </select>
+        </div>
+        <div className="flex items-center gap-1">
+          <Button 
+            variant="ghost" 
+            size="icon" 
+            className="h-5 w-5 hover:text-emerald-500"
+            onClick={() => createSession(`Session ${sessions.length + 1}`)}
+            disabled={isCreatingSession}
+            title="New Session"
+          >
+            {isCreatingSession ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Plus className="h-3 w-3" />
+            )}
+          </Button>
+          {sessions.length > 1 && (
+            <Button 
+              variant="ghost" 
+              size="icon" 
+              className="h-5 w-5 hover:text-destructive"
+              onClick={() => currentSessionId && deleteSession(currentSessionId)}
+              title="Delete Session"
+            >
+              <Trash2 className="h-3 w-3" />
+            </Button>
+          )}
         </div>
       </div>
 
@@ -310,6 +393,40 @@ export default function ChatPanel() {
                 {verifyError}
               </span>
             )}
+          </div>
+
+          <div className="pt-2 border-t border-border/20 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] text-muted-foreground">Global Data</span>
+              <div className="flex gap-2">
+                <Button 
+                  variant="ghost" 
+                  size="sm" 
+                  className="h-6 px-2 text-[9px] hover:bg-destructive/10 hover:text-destructive"
+                  onClick={async () => {
+                    if (confirm('Are you sure you want to reset all settings?')) {
+                      await fetchApi('/settings/llm_settings', { method: 'DELETE' });
+                      setLLMSettings({ apiKey: '', model: 'gemini/gemini-2.0-flash' });
+                    }
+                  }}
+                >
+                  Reset Settings
+                </Button>
+                <Button 
+                  variant="ghost" 
+                  size="sm" 
+                  className="h-6 px-2 text-[9px] text-destructive hover:bg-destructive/10"
+                  onClick={() => {
+                    if (confirm('DANGER: This will delete all chat history and workspace state. Proceed?')) {
+                      resetAll();
+                    }
+                  }}
+                >
+                  <AlertTriangle className="h-2.5 w-2.5 mr-1" />
+                  Wipe Database
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       )}

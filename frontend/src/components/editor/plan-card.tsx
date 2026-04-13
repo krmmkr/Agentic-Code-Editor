@@ -8,8 +8,8 @@ import { useEditor, PLAN_TAB_ID } from '@/store/editor';
 
 interface PlanCardProps {
   plan: ImplementationPlan;
-  onApprove: () => void;
-  onReject: (reason?: string) => void;
+  onApprove?: () => void;
+  onReject?: (reason?: string) => void;
 }
 
 export default function PlanCard({ plan, onApprove, onReject }: PlanCardProps) {
@@ -146,7 +146,7 @@ export default function PlanCard({ plan, onApprove, onReject }: PlanCardProps) {
               variant="destructive"
               size="sm"
               className="h-7 text-xs flex-1"
-              onClick={() => onReject()}
+              onClick={() => onReject?.()}
             >
               <X className="h-3.5 w-3.5 mr-1" />
               Reject Plan

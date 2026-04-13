@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { useFileSystem } from './file-system';
+import { fetchApi } from '@/lib/api-client';
 
 export const PLAN_TAB_ID = '__plan__';
 
@@ -52,6 +53,7 @@ interface EditorState {
   closeOtherTabs: (path: string) => void;
   closeAllTabs: () => void;
   isPlanTabActive: () => boolean;
+  validateTabs: (existingPaths: string[]) => void;
 
   // View actions
   setViewMode: (mode: 'editor' | 'diff') => void;
@@ -95,12 +97,23 @@ export const useEditor = create<EditorState>()(
           const openTabs = state.openTabs.includes(path)
             ? state.openTabs
             : [...state.openTabs, path];
-          return { 
+          const result = { 
             openTabs, 
             activeTab: path, 
             activeDiff: null,
-            viewMode: 'editor' 
+            viewMode: 'editor' as const
           };
+          
+          // Sync to DB if we have a session
+          const sessionId = window.localStorage.getItem('current_session_id');
+          if (sessionId) {
+            fetchApi(`/sessions/${sessionId}/state`, {
+              method: 'PUT',
+              body: JSON.stringify({ open_tabs: openTabs })
+            }).catch(e => console.error(e));
+          }
+
+          return result;
         });
       },
 
@@ -126,11 +139,21 @@ export const useEditor = create<EditorState>()(
           if (activeTab === path) {
             activeTab = openTabs[Math.min(idx, openTabs.length - 1)] || null;
           }
-          return { 
+          const result = { 
             openTabs, 
             activeTab: activeTab === path ? null : activeTab,
-            viewMode: 'editor'
+            viewMode: 'editor' as const
           };
+
+          const sessionId = window.localStorage.getItem('current_session_id');
+          if (sessionId) {
+            fetchApi(`/sessions/${sessionId}/state`, {
+              method: 'PUT',
+              body: JSON.stringify({ open_tabs: openTabs })
+            }).catch(e => console.error(e));
+          }
+
+          return result;
         });
       },
 
@@ -151,7 +174,14 @@ export const useEditor = create<EditorState>()(
       setDiffMode: (diffMode) => set({ diffMode }),
       setDiffSource: (diffSource) => set({ diffSource }),
       setMarkdownPreview: (markdownPreview) => set({ markdownPreview }),
-      setLLMSettings: (llmSettings) => set({ llmSettings }),
+      setLLMSettings: (llmSettings) => {
+        set({ llmSettings });
+        // Sync to backend
+        fetchApi('/settings', {
+          method: 'POST',
+          body: JSON.stringify({ key: 'llm_settings', value: llmSettings })
+        }).catch(err => console.error('Failed to sync settings to DB:', err));
+      },
 
       closeSavedTabs: () => {
         const { openTabs } = get();
@@ -167,9 +197,19 @@ export const useEditor = create<EditorState>()(
         set({ activeDiff: diff, viewMode: diff ? 'diff' : 'editor' }),
 
       addPendingChange: (change: DiffChange) =>
-        set(state => ({
-          pendingChanges: [...state.pendingChanges, change],
-        })),
+        set(state => {
+          const next = [...state.pendingChanges, change];
+          
+          const sessionId = window.localStorage.getItem('current_session_id');
+          if (sessionId) {
+            fetchApi(`/sessions/${sessionId}/state`, {
+              method: 'PUT',
+              body: JSON.stringify({ pending_changes: next })
+            }).catch(e => console.error(e));
+          }
+
+          return { pendingChanges: next };
+        }),
 
       acceptChange: (changeId: string) =>
         set(state => ({
@@ -204,6 +244,29 @@ export const useEditor = create<EditorState>()(
 
       clearChat: () =>
         set({ chatMessages: [] }),
+
+      validateTabs: (existingPaths: string[]) => {
+        set(state => {
+          const validPaths = new Set(existingPaths);
+          const nextTabs = state.openTabs.filter(tab => 
+            tab === PLAN_TAB_ID || validPaths.has(tab.startsWith('/') ? tab.slice(1) : tab)
+          );
+          
+          let nextActiveTab = state.activeTab;
+          if (nextActiveTab && nextActiveTab !== PLAN_TAB_ID) {
+            const normalizedActive = nextActiveTab.startsWith('/') ? nextActiveTab.slice(1) : nextActiveTab;
+            if (!validPaths.has(normalizedActive)) {
+              // Active tab no longer exists, switch to plan or null
+              nextActiveTab = nextTabs.length > 0 ? nextTabs[0] : null;
+            }
+          }
+
+          return { 
+            openTabs: nextTabs,
+            activeTab: nextActiveTab
+          };
+        });
+      },
     }),
     {
       name: 'editor-storage',
