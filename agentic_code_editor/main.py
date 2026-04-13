@@ -41,7 +41,8 @@ from agentic_code_editor.ws_manager import register_handlers
 from agentic_code_editor.database import (
     init_db, get_sessions, get_session_by_id, create_session_record, 
     delete_session_record, update_session_state, add_message_record, 
-    get_messages, set_setting, get_setting, reset_db_content, delete_setting_record
+    get_messages, set_setting, get_setting, reset_db_content, delete_setting_record,
+    rename_session_record
 )
 
 # ---------------------------------------------------------------------------
@@ -171,8 +172,7 @@ class CreateSessionRequest(BaseModel):
     id: str
     title: str | None = None
     workspace_path: str
-
-
+class AddMessageRequest(BaseModel):
     session_id: str
     role: str
     content: str
@@ -182,6 +182,7 @@ class CreateSessionRequest(BaseModel):
 class SessionStateUpdate(BaseModel):
     open_tabs: List[str] | None = None
     pending_changes: List[Any] | None = None
+    current_plan: Dict[str, Any] | None = None
 
 
 class SummaryFile(BaseModel):
@@ -392,7 +393,7 @@ async def add_message_endpoint(req: AddMessageRequest):
     # rename it to a snippet of the first message.
     if req.role == 'user':
         session_rec = get_session_by_id(req.session_id)
-        if session_rec and (not session_rec.title or session_rec.title.startswith('Session ')):
+        if session_rec and (not session_rec.title or session_rec.title == 'New Session' or session_rec.title.startswith('Session ')):
             # Generate a title (simple first-message snippet for now, can be LLM later)
             new_title = req.content[:40].strip() + ("..." if len(req.content) > 40 else "")
             rename_session_record(req.session_id, new_title)
@@ -424,7 +425,7 @@ async def delete_setting_endpoint(key: str):
 async def reset_database_endpoint():
     """Wipe all sessions and messages."""
     reset_db_content()
-    return {"status": "success"}
+    return {"status": "success", "message": "Database wiped successfully"}
 
 
 @app.get("/sessions/{session_id}")
@@ -439,7 +440,7 @@ async def get_session_endpoint(session_id: str):
 @app.put("/sessions/{session_id}/state")
 async def update_session_state_endpoint(session_id: str, req: SessionStateUpdate):
     """Update UI state (tabs, changes) for a session."""
-    return update_session_state(session_id, req.open_tabs, req.pending_changes)
+    return update_session_state(session_id, req.open_tabs, req.pending_changes, req.current_plan)
 
 
 @app.delete("/sessions/{session_id}")

@@ -110,6 +110,7 @@ class CodeAgent:
         self._last_file_contents = {}
         self._last_plan = None
         self._last_approval = None
+        self._pending_changes = []  # Persistent changes awaiting review
         logger.info("Agent LLM backend: %s (model: %s)", self._backend, self._model or "default")
 
     def cancel(self) -> None:
@@ -251,7 +252,8 @@ class CodeAgent:
         """
         self._cancelled = False
         self._llm_settings = llm_settings or {}
-        from .database import get_setting
+        self._current_session_id = session_id
+        from .database import get_setting, get_session_by_id
         
         # Priority: request > DB > Env
         db_model = get_setting("llm_model")
@@ -264,16 +266,39 @@ class CodeAgent:
         self._backend = _get_llm_backend(self._model)
         logger.info("Using model: %s (backend: %s)", self._model, self._backend)
 
+        # Recover state if session_id provided
+        if session_id:
+            session_rec = get_session_by_id(session_id)
+            if session_rec:
+                try:
+                    self._pending_changes = json.loads(session_rec.pending_changes)
+                    logger.info("Recovered %d pending changes for session %s", len(self._pending_changes), session_id)
+                    if session_rec.current_plan:
+                        self._last_plan = json.loads(session_rec.current_plan)
+                        logger.info("Recovered active plan for session %s", session_id)
+                except Exception as e:
+                    logger.warning("Failed to recover session state: %s", e)
+
         try:
             # 0. CHECK FOR RESUMPTION
             resumable_plan = None
             is_continuation = any(word in user_message.lower() for word in ["continue", "resume", "go on", "keep going"])
+            is_generic_msg = not user_message or any(word == user_message.lower().strip() for word in ["hello", "hi", "hey", "ping"])
             
-            if session_id and is_continuation:
+            # If we already have an approved plan in state, and the message is generic or a continuation, jump to it
+            if self._last_plan and self._last_plan.get("status") == "approved":
+                has_unfinished = any(s.get("status") != "completed" for s in self._last_plan.get("steps", []))
+                if has_unfinished and (is_generic_msg or is_continuation):
+                    logger.info("Auto-resuming existing approved plan in memory")
+                    resumable_plan = self._last_plan
+
+            if not resumable_plan and session_id and is_continuation:
                 resumable_plan = await self._find_resumable_plan(session_id)
             
             if resumable_plan:
-                yield AgentEvent.build("thought", {"content": f"Found existing plan for this session. Resuming implementation..."})
+                yield AgentEvent.build("thought", {"content": f"Resuming implementation for: {resumable_plan.get('title', 'Current Plan')}"})
+                # Emit the plan immediately so the UI can draw it
+                yield AgentEvent.build("plan", resumable_plan)
                 plan = resumable_plan
             else:
                 # 1. RESEARCH PHASE
@@ -905,13 +930,23 @@ class CodeAgent:
                 )
 
                 change_id = _uid()
-                yield AgentEvent.build("file_change", {
+                change_payload = {
                     "id": change_id,
                     "path": fpath,
                     "original": original,
                     "modified": modified,
                     "description": step_desc,
-                })
+                }
+                
+                # Track in agent memory
+                self._pending_changes.append(change_payload)
+                
+                # Sync to database
+                from .database import update_session_state
+                if session_id := getattr(self, "_current_session_id", None):
+                   update_session_state(session_id, pending_changes=self._pending_changes)
+
+                yield AgentEvent.build("file_change", change_payload)
 
                 # Wait for user approval
                 approved = await self._wait_for_approval(
@@ -931,6 +966,12 @@ class CodeAgent:
                         yield AgentEvent.build("error", {"detail": f"Failed to write: {write_result.error}"})
                 else:
                     yield AgentEvent.build("message", {"content": f"Skipped change: {step_desc}"})
+
+                # Remove from pending changes and sync to DB
+                self._pending_changes = [c for c in self._pending_changes if c["id"] != change_id]
+                from .database import update_session_state
+                if session_id := getattr(self, "_current_session_id", None):
+                    update_session_state(session_id, pending_changes=self._pending_changes)
         else:
             # Generic step
             await asyncio.sleep(0.3)
@@ -1153,6 +1194,9 @@ class CodeAgent:
     async def _run_approval_phase(self, plan: dict, wait_for_command):
         """Phase 3: Wait for user review and approval."""
         yield AgentEvent.build("plan", plan)
+        if self._current_session_id:
+            from .database import update_session_state
+            update_session_state(self._current_session_id, current_plan=plan)
         
         # Write files for user to review in their own editor
         self._write_review_files(plan)
@@ -1174,6 +1218,8 @@ class CodeAgent:
         
         payload = approval_cmd.get("payload", {})
         task_md = payload.get("task_md", "")
+
+        original_plan["status"] = "approved"
 
         # Fallback to reading from disk if memory sync is empty
         if not task_md:
@@ -1199,6 +1245,9 @@ class CodeAgent:
             "steps": original_plan["steps"],
         })
         self._last_plan = original_plan
+        if self._current_session_id:
+            from .database import update_session_state
+            update_session_state(self._current_session_id, current_plan=original_plan)
 
     async def _run_implementation_phase(self, plan: dict, wait_for_command, file_contents: dict):
         """Phase 4: Gated implementation of plan steps."""
@@ -1215,6 +1264,13 @@ class CodeAgent:
             step_desc = step["description"]
             
             yield AgentEvent.build("thought", {"content": f"Next step: '{step_desc}'"})
+            
+            # Update step status in the plan object
+            step["status"] = "running"
+            if self._current_session_id:
+                from .database import update_session_state
+                update_session_state(self._current_session_id, current_plan=plan)
+
             yield AgentEvent.build("step_update", {
                 "step_id": step_id,
                 "plan_id": plan_id,
@@ -1230,6 +1286,17 @@ class CodeAgent:
                     yield event
                 
                 # Step finished
+                step["status"] = "completed"
+                if self._current_session_id:
+                    from .database import update_session_state
+                    update_session_state(self._current_session_id, current_plan=plan)
+
+                yield AgentEvent.build("step_update", {
+                    "step_id": step_id,
+                    "plan_id": plan_id,
+                    "status": "completed",
+                    "detail": "Step complete",
+                })
                 yield AgentEvent.build("step_update", {
                     "step_id": step_id,
                     "plan_id": plan_id,

@@ -298,7 +298,7 @@ export default function ChatPanel() {
             variant="ghost" 
             size="icon" 
             className="h-5 w-5 hover:text-emerald-500"
-            onClick={() => createSession(`Session ${sessions.length + 1}`)}
+            onClick={() => createSession('New Session')}
             disabled={isCreatingSession}
             title="New Session"
           >
@@ -308,7 +308,7 @@ export default function ChatPanel() {
               <Plus className="h-3 w-3" />
             )}
           </Button>
-          {sessions.length > 1 && (
+          {sessions.length > 0 && (
             <Button 
               variant="ghost" 
               size="icon" 

@@ -111,6 +111,7 @@ interface AgentStore {
   loadSession: (sessionId: string) => Promise<void>;
   createSession: (title: string) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
+  updateSessionState: () => Promise<void>;
 
   // Internal
   sendCommand: (command: ClientCommand) => void;
@@ -203,8 +204,8 @@ export const useAgent = create<AgentStore>((set, get) => ({
         } else if (sessions.length > 0) {
           await get().loadSession(sessions[0].id);
         } else {
-          // Create initial session if really empty for this workspace
-          await get().createSession('Session 1');
+          // Do not auto-create Session 1 here to allow completely empty state
+          set({ currentSessionId: null });
         }
       } catch (err) {
         console.error('Failed to restore persistent session:', err);
@@ -258,6 +259,7 @@ export const useAgent = create<AgentStore>((set, get) => ({
       showTerminal: true,
       currentPlan: { ...currentPlan, status: 'approved' }
     });
+    get().updateSessionState();
     get().addActivity('Plan approved — agent is implementing...', true);
 
     // 2. Try to get fresh content from the filesystem store before approving
@@ -295,6 +297,7 @@ export const useAgent = create<AgentStore>((set, get) => ({
       statusDetail: reason || 'Plan rejected',
       currentPlan: { ...currentPlan, status: 'rejected' }
     });
+    get().updateSessionState();
     get().addActivity(`Plan rejected${reason ? `: ${reason}` : ''}`, true);
 
     // 2. Send command
@@ -421,6 +424,7 @@ export const useAgent = create<AgentStore>((set, get) => ({
       statusDetail: 'Task cancelled',
       currentPlan: null,
     });
+    get().updateSessionState();
     get().addActivity('Task cancelled', true);
     get().sendCommand({ type: 'cancel' });
   },
@@ -641,6 +645,7 @@ export const useAgent = create<AgentStore>((set, get) => ({
               }
             : null,
         }));
+        get().updateSessionState();
         break;
       }
 
@@ -719,14 +724,23 @@ export const useAgent = create<AgentStore>((set, get) => ({
       });
 
       // Active Plan Recovery:
-      // If the last assistant message has a payload that looks like a pending plan, 
-      // restore it to the active state so the user can approve/reject it.
-      const activity = get().activityLog;
-      const lastAssistantMessage = [...activity].reverse().find(m => m.role === 'assistant' && m.payload?.steps);
-      
-      if (lastAssistantMessage && lastAssistantMessage.payload.status === 'pending') {
-        console.log('Restoring active plan from history:', lastAssistantMessage.id);
-        set({ currentPlan: lastAssistantMessage.payload });
+      // Priority 1: Use the dedicated current_plan field from DB
+      // Priority 2: Fallback to scanning message history (last assistant message with steps)
+      if (sessionData.current_plan) {
+        try {
+          const recoveredPlan = JSON.parse(sessionData.current_plan);
+          set({ currentPlan: recoveredPlan });
+          console.log('Restored active plan from dedicated field:', recoveredPlan.id, recoveredPlan.status);
+        } catch (e) {
+          console.error('Failed to parse current_plan:', e);
+        }
+      } else {
+        const activity = get().activityLog;
+        const lastAssistantMessage = [...activity].reverse().find(m => m.role === 'assistant' && m.payload?.steps);
+        if (lastAssistantMessage && lastAssistantMessage.payload.status === 'pending') {
+          console.log('Restoring active plan from history fallback:', lastAssistantMessage.id);
+          set({ currentPlan: lastAssistantMessage.payload });
+        }
       }
 
       // Update Editor UI State
@@ -746,25 +760,48 @@ export const useAgent = create<AgentStore>((set, get) => ({
     }
   },
 
+  updateSessionState: async () => {
+    const { currentSessionId, currentPlan } = get();
+    const { openTabs, pendingChanges } = useEditor.getState();
+    if (!currentSessionId) return;
+
+    try {
+      await fetchApi(`/sessions/${currentSessionId}/state`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          open_tabs: openTabs,
+          pending_changes: pendingChanges,
+          current_plan: currentPlan
+        })
+      });
+    } catch (err) {
+      console.warn('Silent failure updating session state:', err);
+    }
+  },
+
   createSession: async (title: string) => {
     if (get().isCreatingSession) return;
+    
+    const workspacePath = useFileSystem.getState().currentWorkspacePath;
+    if (!workspacePath) {
+      console.warn('Cannot create session: No workspace path selected');
+      return;
+    }
+
     set({ isCreatingSession: true });
 
     try {
-      const workspacePath = useFileSystem.getState().currentWorkspacePath;
-      
-      // Check for name collision locally first
-      const existing = get().sessions.find(s => s.title === title && s.workspace_path === workspacePath);
-      if (existing) {
-        console.warn('Session with this name already exists, switching to it instead of creating duplicate.');
-        await get().loadSession(existing.id);
-        return;
+      // Check for name collision and append index if needed
+      let finalTitle = title;
+      let count = 1;
+      while (get().sessions.find(s => s.title === finalTitle)) {
+        finalTitle = `${title} (${++count})`;
       }
 
       const id = crypto.randomUUID();
       await fetchApi('/sessions', {
         method: 'POST',
-        body: JSON.stringify({ id, workspace_path: workspacePath, title })
+        body: JSON.stringify({ id, workspace_path: workspacePath, title: finalTitle })
       });
       
       const sessions = await fetchApi<any[]>(`/sessions?workspace=${encodeURIComponent(workspacePath)}`);
@@ -785,8 +822,22 @@ export const useAgent = create<AgentStore>((set, get) => ({
       set({ sessions });
       
       if (get().currentSessionId === sessionId) {
-        if (sessions.length > 0) await get().loadSession(sessions[0].id);
-        else await get().createSession('Session 1');
+        if (sessions.length > 0) {
+          await get().loadSession(sessions[0].id);
+        } else {
+          // Truly empty state - reset ALL volatile session state
+          set({ 
+            currentSessionId: null, 
+            activityLog: [],
+            currentThought: null,
+            currentPlan: null,
+            terminalCommands: [],
+            readFiles: [],
+            agentState: 'idle' as const,
+            statusDetail: ''
+          });
+          useEditor.setState({ openTabs: [], pendingChanges: [], activeTab: null });
+        }
       }
     } catch (err) {
       console.error('Failed to delete session:', err);
