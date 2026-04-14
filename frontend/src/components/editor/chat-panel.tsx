@@ -25,28 +25,56 @@ import {
   Eraser,
   Loader2,
   AlertTriangle,
+  RefreshCw,
+  Square,
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { fetchApi } from '@/lib/api-client';
 import { useEditor, type ChatMessage, type DiffChange } from '@/store/editor';
-import { useAgent } from '@/store/agent';
+import { useAgent, type AgentMessage } from '@/store/agent';
 import PlanCard from './plan-card';
 import { Button } from '@/components/ui/button';
 
+// ── Types ────────────────────────────────────────────────
+
+interface Turn {
+  id: string;
+  userMessage: AgentMessage;
+  activities: AgentMessage[];
+}
+
+function groupActivityIntoTurns(log: AgentMessage[]): Turn[] {
+  const turns: Turn[] = [];
+  let currentTurn: Turn | null = null;
+
+  for (const item of log) {
+    if (item.role === 'user') {
+      if (currentTurn) turns.push(currentTurn);
+      currentTurn = {
+        id: item.id,
+        userMessage: item,
+        activities: [],
+      };
+    } else if (currentTurn) {
+      currentTurn.activities.push(item);
+    }
+  }
+
+  if (currentTurn) turns.push(currentTurn);
+  return turns;
+}
+
 // ── Activity Log Item ────────────────────────────────────
 
-function ActivityItem({ item }: { item: { id: string; content: string; timestamp: number; isStatus?: boolean; role?: 'user' | 'assistant'; payload?: any } }) {
+function ActivityItem({ item }: { item: AgentMessage }) {
   const isStatus = item.isStatus;
   const isAssistant = item.role === 'assistant';
 
   if (isStatus) {
     return (
-      <div className="flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground">
-        <div className="h-1 w-1 rounded-full bg-muted-foreground/40 shrink-0" />
+      <div className="flex items-center gap-2 px-3 py-1.5 text-[10px] text-muted-foreground/70">
+        <div className="h-1 w-1 rounded-full bg-muted-foreground/30 shrink-0" />
         <span className="truncate">{item.content}</span>
-        <span className="shrink-0 opacity-50">
-          {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-        </span>
       </div>
     );
   }
@@ -69,16 +97,16 @@ function ActivityItem({ item }: { item: { id: string; content: string; timestamp
             {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           </span>
         </div>
-        <div className="text-sm prose prose-sm dark:prose-invert max-w-none">
+        <div className="text-sm prose prose-sm dark:prose-invert max-w-none prose-p:leading-relaxed prose-pre:bg-muted/50">
           <ReactMarkdown>{item.content}</ReactMarkdown>
         </div>
         
         {/* Historical Plan/Payload Rendering */}
         {item.payload && item.payload.steps && (
-          <div className="mt-3 border rounded-lg bg-background/50 overflow-hidden">
+          <div className="mt-3 border rounded-lg bg-background/50 overflow-hidden shadow-sm">
             <div className="px-3 py-1.5 bg-muted/30 border-b flex items-center justify-between">
               <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                Historical Plan Snapshot
+                Plan Snapshot
               </span>
             </div>
             <div className="p-2 origin-top scale-[0.9] -m-[5%]">
@@ -87,6 +115,63 @@ function ActivityItem({ item }: { item: { id: string; content: string; timestamp
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Chat Turn Component ──────────────────────────────────
+
+function ChatTurn({ 
+  turn, 
+  isLast, 
+  isAgentActive 
+}: { 
+  turn: Turn; 
+  isLast: boolean; 
+  isAgentActive: boolean 
+}) {
+  const [isExpanded, setIsExpanded] = useState(isLast || isAgentActive);
+
+  // Auto-expand if agent starts working on THIS turn
+  useEffect(() => {
+    if (isLast && isAgentActive) {
+      setIsExpanded(true);
+    }
+  }, [isLast, isAgentActive]);
+
+  return (
+    <div className="border-b border-border/10 last:border-0 overflow-hidden">
+      <button
+        onClick={() => setIsExpanded(!isExpanded)}
+        className={`w-full flex items-center gap-3 px-3 py-3 text-left transition-colors hover:bg-muted/30 ${!isExpanded ? 'bg-muted/10' : ''}`}
+      >
+        <div className="shrink-0">
+          {isExpanded ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
+        </div>
+        <div className="flex-1 min-w-0 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="h-5 w-5 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
+              <User className="h-3 w-3 text-primary" />
+            </div>
+            <span className={`text-xs font-medium truncate ${!isExpanded ? 'text-foreground' : 'text-muted-foreground'}`}>
+              {turn.userMessage.content}
+            </span>
+          </div>
+          <span className="text-[10px] text-muted-foreground whitespace-nowrap opacity-60">
+            {new Date(turn.userMessage.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </span>
+        </div>
+      </button>
+
+      {isExpanded && (
+        <div className="divide-y divide-border/10 bg-background/40">
+          {/* We show the full user message first inside the expanded view for clarity */}
+          <ActivityItem item={turn.userMessage} />
+          {turn.activities.map(act => (
+            <ActivityItem key={act.id} item={act} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -171,6 +256,10 @@ export default function ChatPanel() {
     resetAll,
     isCreatingSession,
     sessionsLoaded,
+    currentSessionTokens,
+    currentSessionCost,
+    currentContextTokens,
+    maxContextTokens,
   } = useAgent();
   const { pendingChanges } = useEditor();
   const [input, setInput] = useState('');
@@ -239,6 +328,17 @@ export default function ChatPanel() {
           <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             Agent Chat
           </span>
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-muted-foreground/60 border-l pl-2 border-border/50">
+              {currentSessionTokens.toLocaleString()} tokens
+            </span>
+            <span className="text-[10px] text-muted-foreground/60">
+              ${currentSessionCost.toFixed(4)}
+            </span>
+            <span className="text-[10px] text-muted-foreground/60" title="Current Context Window Usage">
+              Context: {currentContextTokens.toLocaleString()} / {maxContextTokens ? (maxContextTokens / 1000).toFixed(0) + 'k' : '??'}
+            </span>
+          </div>
           {unresolvedChanges.length > 0 && (
             <span className="px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-orange-500/10 text-orange-500">
               {unresolvedChanges.length} pending
@@ -246,6 +346,17 @@ export default function ChatPanel() {
           )}
         </div>
         <div className="flex items-center gap-0.5">
+          {isAgentActive && (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 text-destructive hover:text-destructive hover:bg-destructive/10"
+              onClick={() => useAgent.getState().cancelTask()}
+              title="Stop Agent"
+            >
+              <Square className="h-3 w-3 fill-current" />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -339,6 +450,18 @@ export default function ChatPanel() {
           </div>
           <div className="space-y-1.5">
             <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              API Base URL
+            </label>
+            <input
+              type="text"
+              value={llmSettings.apiBase}
+              onChange={(e) => setLLMSettings({ ...llmSettings, apiBase: e.target.value })}
+              placeholder="e.g. http://localhost:11434/v1"
+              className="w-full text-xs px-2 py-1.5 rounded border bg-background focus:outline-none focus:ring-1 focus:ring-primary"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
               Model Override
             </label>
             <div className="flex gap-2">
@@ -406,7 +529,7 @@ export default function ChatPanel() {
                   onClick={async () => {
                     if (confirm('Are you sure you want to reset all settings?')) {
                       await fetchApi('/settings/llm_settings', { method: 'DELETE' });
-                      setLLMSettings({ apiKey: '', model: 'gemini/gemini-2.0-flash' });
+                      setLLMSettings({ apiKey: '', model: 'gemini/gemini-2.0-flash', apiBase: '' });
                     }
                   }}
                 >
@@ -427,6 +550,27 @@ export default function ChatPanel() {
                 </Button>
               </div>
             </div>
+          </div>
+          <div className="pt-2 border-t border-border/20">
+            <Button 
+              variant="outline" 
+              size="sm" 
+              className="w-full text-[10px] h-7 gap-2"
+              onClick={async () => {
+                try {
+                  await fetchApi('/settings', {
+                    method: 'POST',
+                    body: JSON.stringify({ key: 'llm_settings', value: llmSettings })
+                  });
+                  alert('Codebase re-indexing triggered!');
+                } catch (e) {
+                  alert('Failed to trigger indexing');
+                }
+              }}
+            >
+              <RefreshCw className="h-3 w-3" />
+              Re-index Codebase
+            </Button>
           </div>
         </div>
       )}
@@ -510,10 +654,18 @@ export default function ChatPanel() {
             </div>
           </div>
         ) : (
-          <div className="divide-y divide-border/20">
-            {activityLog.map(item => (
-              <ActivityItem key={item.id} item={item} />
-            ))}
+          <div className="divide-y divide-border/10">
+            {(() => {
+              const turns = groupActivityIntoTurns(activityLog);
+              return turns.map((turn, i) => (
+                <ChatTurn 
+                  key={turn.id} 
+                  turn={turn} 
+                  isLast={i === turns.length - 1} 
+                  isAgentActive={isAgentActive}
+                />
+              ));
+            })()}
 
             {/* Plan card */}
             {currentPlan && (

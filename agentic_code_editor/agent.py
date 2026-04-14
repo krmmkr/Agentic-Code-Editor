@@ -1,5 +1,5 @@
 """
-agent.py — Agent orchestrator powered by LiteLLM (multi-provider LLM).
+agent.py — Agentic code editor powered by LiteLLM tool-calling ReAct loop.
 
 Supports 100+ LLM providers via LiteLLM:
   - GLM (Zhipu):       LITELLM_MODEL=glm/glm-4-flash   LITELLM_API_KEY=xxx
@@ -8,17 +8,14 @@ Supports 100+ LLM providers via LiteLLM:
   - DeepSeek:          LITELLM_MODEL=deepseek/deepseek-chat  DEEPSEEK_API_KEY=xxx
   - Anthropic Claude:  LITELLM_MODEL=claude-3-5-sonnet-20241022  ANTHROPIC_API_KEY=xxx
 
-The agent:
-  1. Receives a user message via Socket.IO.
-  2. Reads relevant files, builds a plan (using LLM).
-  3. Sends the plan to the frontend and **waits for approval**.
-  4. Executes steps one-by-one; file changes and terminal commands
-     each **wait for user approval** before being applied.
-  5. Yields structured AgentEvent objects throughout so the WebSocket
-     manager can push them to the frontend in real-time.
+The agent uses a Reason-Act-Observe loop with native tool calling:
+  1. The LLM receives the user message + tool definitions.
+  2. The LLM decides which tools to call (read_file, write_file, run_terminal, etc.)
+  3. Tool results are fed back into the conversation.
+  4. The loop continues until the LLM sends a final text response or hits iteration limits.
 
-The `run()` method is an **async generator** — callers iterate over it
-with `async for event in agent.run(...`.
+Human-in-the-loop: write_file, run_terminal, and propose_plan require user approval
+before execution. All other tools (read, list, search, map) are safe and execute immediately.
 
 Field names MUST match the frontend TypeScript types in src/lib/api-client.ts.
 """
@@ -26,30 +23,28 @@ Field names MUST match the frontend TypeScript types in src/lib/api-client.ts.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
-from .protocol import (
-    AgentEvent,
-    ChatCommandPayload,
-    ErrorPayload,
-    FileChangePayload,
-    FileReadPayload,
-    MessagePayload,
-    PlanPayload,
-    PlanStepPayload,
-    StatusPayload,
-    StepUpdatePayload,
-    TerminalCommandPayload,
-    TerminalOutputPayload,
-)
+import yaml
+
+from .protocol import AgentEvent
 from . import tools
-from .database import update_session_state, get_messages, update_message_record, get_setting
+from .tool_definitions import (
+    TOOL_DEFINITIONS,
+    TOOLS_REQUIRING_APPROVAL,
+    execute_tool,
+    get_tool_definitions,
+)
+from .database import update_session_state, get_messages, update_message_record, get_setting, add_message_record
+import litellm
 
 logger = logging.getLogger(__name__)
 
@@ -58,36 +53,71 @@ def _uid() -> str:
     return str(uuid.uuid4())
 
 
-# ---------------------------------------------------------------------------
-# LLM abstraction via LiteLLM
-# ---------------------------------------------------------------------------
-
-def _get_llm_backend(model: str | None = None) -> str:
-    """
-    Determine which LLM backend to use.
-    
-    Priority:
-      1. Explicit model with provider prefix (e.g. 'deepseek/') -> litellm
-      2. LITELLM_MODEL env var set -> litellm
-      3. GOOGLE_API_KEY env var set -> adk
-      4. Default -> unknown
-    """
-    if model and "/" in model:
-        return "litellm"
-    if os.getenv("LITELLM_MODEL"):
-        return "litellm"
-    if os.getenv("GOOGLE_API_KEY"):
-        return "adk"
-    return "unknown"
+_CONFIG_PATH = Path(__file__).parent / "agent_config.yaml"
 
 
-# ---------------------------------------------------------------------------
-# Agent implementation
-# ---------------------------------------------------------------------------
+def _load_config() -> dict[str, Any]:
+    try:
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        logger.warning("agent_config.yaml not found at %s, using defaults", _CONFIG_PATH)
+        return {}
+    except Exception as exc:
+        logger.error("Failed to load agent config: %s", exc)
+        return {}
+
+
+def _cfg(data: dict, *keys: str, default: Any = None) -> Any:
+    current = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+        if current is None:
+            return default
+    return current
+
+
+class UsageTracker:
+    """Tracks token usage and cost for LLM calls."""
+    def __init__(self):
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_cost = 0.0
+
+    def update(self, response: Any):
+        usage = getattr(response, "usage", None)
+        if usage:
+            self.total_prompt_tokens += getattr(usage, "prompt_tokens", 0)
+            self.total_completion_tokens += getattr(usage, "completion_tokens", 0)
+        
+        try:
+            cost = litellm.completion_cost(completion_response=response)
+            if cost:
+                self.total_cost += float(cost)
+        except Exception:
+            pass
+
+    def get_current_usage(self, response: Any) -> dict:
+        usage = getattr(response, "usage", None)
+        prompt = getattr(usage, "prompt_tokens", 0) if usage else 0
+        completion = getattr(usage, "completion_tokens", 0) if usage else 0
+        cost = 0.0
+        try:
+            cost = float(litellm.completion_cost(completion_response=response) or 0.0)
+        except Exception:
+            pass
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "cost": cost
+        }
+
 
 class CodeAgent:
     """
-    Agentic code editor backend.
+    Agentic code editor backend using a tool-calling ReAct loop.
 
     Usage::
 
@@ -99,143 +129,83 @@ class CodeAgent:
     def __init__(self) -> None:
         self._cancelled = False
         self._llm_settings: dict[str, str] = {}
-        
-        # Load defaults from DB or Env
+        self._config = _load_config()
+
         db_model = get_setting("llm_model")
-        self._model = db_model or os.getenv("LITELLM_MODEL", "gemini/gemini-2.0-flash")
-        self._backend = _get_llm_backend(self._model)
-        
-        # State tracking for phases
-        self._last_repo_context = ""
-        self._last_file_contents = {}
-        self._last_plan = None
-        self._last_approval = None
-        self._pending_changes = []  # Persistent changes awaiting review
-        logger.info("Agent LLM backend: %s (model: %s)", self._backend, self._model or "default")
+        self._model = db_model or os.getenv("LITELLM_MODEL", _cfg(self._config, "model", "default", default="deepseek/deepseek-chat"))
+
+        self._pending_changes: list[dict] = []
+        self._current_session_id: str | None = None
+        self._last_plan: dict | None = None
+        self._completed_steps: set[str] = set()
+        self._active_proc: asyncio.subprocess.Process | None = None
+
+        logger.info("Agent initialized — model: %s", self._model)
+
+    def _get_credentials(self) -> tuple[str | None, str | None]:
+        # Favor stored dict from frontend, fallback to individual keys or env
+        settings = get_setting("llm_settings", {})
+        api_key = self._llm_settings.get("api_key") or settings.get("apiKey") or get_setting("llm_api_key") or os.getenv("LITELLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+        api_base = self._llm_settings.get("api_base") or settings.get("apiBase") or get_setting("llm_api_base") or os.getenv("LITELLM_API_BASE")
+        return api_key, api_base
 
     def cancel(self) -> None:
-        """Signal the agent to stop as soon as possible."""
         self._cancelled = True
-
-    # -----------------------------------------------------------------------
-    # Main entry point — async generator
-    # -----------------------------------------------------------------------
+        if self._active_proc:
+            try:
+                self._active_proc.kill()
+            except Exception:
+                pass
 
     @staticmethod
-    async def verify_credentials(api_key: str | None, model: str | None) -> dict[str, Any]:
-        """Test model access with a minimal completion."""
+    async def verify_credentials(api_key: str | None, model: str | None, api_base: str | None = None) -> dict[str, Any]:
         if not model:
             return {"success": False, "error": "Model not specified"}
-        
         try:
-            # Simple ping with minimal tokens
             import litellm
+            settings = get_setting("llm_settings", {})
+            final_key = api_key or settings.get("apiKey") or get_setting("llm_api_key") or os.getenv("LITELLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+            final_base = api_base or settings.get("apiBase") or get_setting("llm_api_base") or os.getenv("LITELLM_API_BASE")
             response = await litellm.acompletion(
                 model=model,
                 messages=[{"role": "user", "content": "ping"}],
                 max_tokens=1,
-                api_key=api_key
+                api_key=final_key or None,
+                api_base=final_base or None,
             )
             return {"success": True, "model": model}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    async def _find_resumable_plan(self, session_id: str) -> dict[str, Any] | None:
-        """Scan historical messages to find the most recent actionable plan."""
-        from .database import get_messages
-        import json
-        
+    @staticmethod
+    async def get_completion(
+        prefix: str, 
+        suffix: str, 
+        file_path: str, 
+        model: str, 
+        api_key: str | None = None, 
+        api_base: str | None = None
+    ) -> str:
+        """Provide code completion based on prefix and suffix context."""
         try:
-            messages = get_messages(session_id)
-            # Find the most recent assistant message with a plan payload
-            for m in reversed(messages):
-                if m.role == "assistant" and m.payload:
-                    try:
-                        # Extract the payload which is a JSON string in the DB
-                        data = json.loads(m.payload) if isinstance(m.payload, str) else m.payload
-                        # A plan has 'steps' and a status
-                        if isinstance(data, dict) and "steps" in data and data.get("status") in ["pending", "approved"]:
-                            return data
-                    except:
-                        continue
-            return None
-        except Exception as e:
-            logger.error("Failed to find resumable plan: %s", e)
-            return None
-
-    async def _detect_intent(self, user_message: str) -> str:
-        """Detect if the user wants to chat or perform a coding task."""
-        if self._backend != "litellm":
-            return "coding_task" # Default for other backends
+            # We use a standard completion prompt for code fillers
+            messages = [
+                {"role": "system", "content": "You are a code completion assistant. Provide ONLY the code that goes between the prefix and suffix. Do not include triple backticks or explanations."},
+                {"role": "user", "content": f"File: {file_path}\n\nPrefix:\n{prefix}\n\nSuffix:\n{suffix}\n\nCompletion:"}
+            ]
             
-        try:
-            import litellm
-            from .database import get_setting
-            model_name = self._model
-            
-            # Key priority: request > DB > Env
-            db_key = get_setting("llm_api_key")
-            api_key = self._llm_settings.get("api_key") or db_key or os.getenv("LITELLM_API_KEY", "")
-            
-            db_base = get_setting("llm_api_base")
-            api_base = self._llm_settings.get("api_base") or db_base or os.getenv("LITELLM_API_BASE", "")
-
             response = await litellm.acompletion(
-                model=model_name,
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": (
-                            "Categorize the user's message into one of these types:\n"
-                            "1. 'chat': Greetings, simple questions about the agent, or general conversation that doesn't require editing code or deep repository analysis.\n"
-                            "2. 'coding_task': Requests to write, fix, debug, refactor, or analyze the codebase.\n\n"
-                            "Output ONLY the category name ('chat' or 'coding_task')."
-                        )
-                    },
-                    {"role": "user", "content": user_message},
-                ],
+                model=model,
+                messages=messages,
+                max_tokens=256,
+                temperature=0.0,
                 api_key=api_key or None,
                 api_base=api_base or None,
-                temperature=0,
-                max_tokens=10,
             )
-            intent = response.choices[0].message.content or "coding_task"
-            return intent.strip().lower()
+            return response.choices[0].message.content.strip()
         except Exception as e:
-            logger.error("Intent detection failed: %s", e)
-            return "coding_task"
-
-    async def _generate_chat_response(self, user_message: str) -> str:
-        """Generate a direct conversational response."""
-        try:
-            import litellm
-            from .database import get_setting
-            model_name = self._model
-            
-            db_key = get_setting("llm_api_key")
-            api_key = self._llm_settings.get("api_key") or db_key or os.getenv("LITELLM_API_KEY", "")
-            
-            db_base = get_setting("llm_api_base")
-            api_base = self._llm_settings.get("api_base") or db_base or os.getenv("LITELLM_API_BASE", "")
-            
-            logger.info("Generating chat response with model: %s, base: %s", model_name, api_base)
-
-            response = await litellm.acompletion(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": "You are a helpful AI coding assistant. You can chat with the user and acknowledge greetings or questions. Keep it brief."},
-                    {"role": "user", "content": user_message},
-                ],
-                api_key=api_key or None,
-                api_base=api_base or None,
-                temperature=0.7,
-                max_tokens=300,
-                timeout=30
-            )
-            return response.choices[0].message.content or "How can I help you today?"
-        except Exception as e:
-            logger.error("Chat generation failed: %s", e)
-            return "I'm sorry, I'm having trouble connecting to my brain right now. How can I help with your code?"
+            logger.error(f"Autocomplete failed: {e}")
+            return ""
 
     async def run(
         self,
@@ -245,95 +215,166 @@ class CodeAgent:
         session_id: str | None = None,
     ) -> AsyncGenerator[AgentEvent, None]:
         """
-        Process *user_message* and yield AgentEvents.
+        Main entry point — runs the agentic ReAct loop.
 
-        *wait_for_command* is an async generator that yields the next
-        command dict whenever the frontend sends one.
+        The LLM autonomously decides which tools to call. Results feed back
+        into the conversation. The loop continues until the LLM sends a
+        final text response with no tool calls, or the iteration limit is hit.
         """
         self._cancelled = False
         self._llm_settings = llm_settings or {}
         self._current_session_id = session_id
         from .database import get_setting, get_session_by_id
-        
-        # Priority: request > DB > Env
+
         db_model = get_setting("llm_model")
         if self._llm_settings.get("model"):
             self._model = self._llm_settings["model"]
         elif db_model:
             self._model = db_model
-            
-        # Re-evaluate backend based on model
-        self._backend = _get_llm_backend(self._model)
-        logger.info("Using model: %s (backend: %s)", self._model, self._backend)
 
-        # Recover state if session_id provided
-        if session_id:
-            session_rec = get_session_by_id(session_id)
-            if session_rec:
-                try:
-                    self._pending_changes = json.loads(session_rec.pending_changes)
-                    logger.info("Recovered %d pending changes for session %s", len(self._pending_changes), session_id)
-                    if session_rec.current_plan:
-                        self._last_plan = json.loads(session_rec.current_plan)
-                        logger.info("Recovered active plan for session %s", session_id)
-                except Exception as e:
-                    logger.warning("Failed to recover session state: %s", e)
+        logger.info("Agent run starting — model: %s", self._model)
+
+        self._recover_session_state(session_id)
+
+        # Check for simple greetings to avoid heavy tool-calling loops
+        greetings = _cfg(self._config, "agent", "resumption", "greeting_keywords", default=["hello", "hi", "hey"])
+        words = re.findall(r'\w+', user_message.lower())
+        if len(words) <= 3 and any(g in words for g in greetings):
+            yield AgentEvent.build("status", {"state": "analyzing", "detail": "Greeting user..."})
+            yield AgentEvent.build("text", {"content": "Hello! I'm Antigravity, your agentic coding assistant. How can I help you with your codebase today?"})
+            yield AgentEvent.build("status", {"state": "complete", "detail": "Ready"})
+            return
 
         try:
-            # 0. CHECK FOR RESUMPTION
-            file_contents = {}
-            repo_context = ""
-            resumable_plan = None
-            is_continuation = any(word in user_message.lower() for word in ["continue", "resume", "go on", "keep going"])
-            is_generic_msg = not user_message or any(word == user_message.lower().strip() for word in ["hello", "hi", "hey", "ping"])
-            
-            # If we already have an approved plan in state, and the message is generic or a continuation, jump to it
-            if self._last_plan and self._last_plan.get("status") == "approved":
-                has_unfinished = any(s.get("status") != "completed" for s in self._last_plan.get("steps", []))
-                if has_unfinished and (is_generic_msg or is_continuation):
-                    logger.info("Auto-resuming existing approved plan in memory")
-                    resumable_plan = self._last_plan
+            yield AgentEvent.build("status", {"state": "analyzing", "detail": "Agent starting..."})
 
-            if not resumable_plan and session_id and is_continuation:
-                resumable_plan = await self._find_resumable_plan(session_id)
-            
-            if resumable_plan:
-                yield AgentEvent.build("thought", {"content": f"Resuming implementation for: {resumable_plan.get('title', 'Current Plan')}"})
-                # Emit the plan immediately so the UI can draw it
-                yield AgentEvent.build("plan", resumable_plan)
-                plan = resumable_plan
-            else:
-                # 1. RESEARCH PHASE
-                async for event in self._run_research_phase(user_message):
-                    yield event
-                if self._cancelled: return
-                repo_context = self._last_repo_context
-                file_contents = self._last_file_contents
+            messages = self._build_initial_messages(user_message)
+            tool_defs = get_tool_definitions()
+            max_iterations = _cfg(self._config, "agent", "max_iterations", default=50)
+            max_errors = _cfg(self._config, "agent", "max_consecutive_errors", default=3)
 
-                # 2. PLANNING PHASE
-                async for event in self._run_planning_phase(user_message, repo_context, file_contents):
-                    yield event
-                if self._cancelled or not self._last_plan: return
-                plan = self._last_plan
+            iteration = 0
+            consecutive_errors = 0
 
-            # 3. APPROVAL PHASE (Wait for user)
-            async for event in self._run_approval_phase(plan, wait_for_command):
-                yield event
-            if not self._last_approval:
-                yield AgentEvent.build("thought", {"content": "Plan rejected. I'll wait for further instructions."})
-                yield AgentEvent.build("complete", {})
-                return
-            
-            # Update plan based on potential manual edits from disk or memory sync
-            async for event in self._sync_approved_plan(plan, self._last_approval):
-                yield event
-            plan = self._last_plan
+            usage_tracker = UsageTracker()
 
-            # 4. IMPLEMENTATION PHASE (Gated)
-            async for event in self._run_implementation_phase(plan, wait_for_command, file_contents):
-                yield event
+            while iteration < max_iterations and not self._cancelled:
+                iteration += 1
+                logger.debug("Agent iteration %d/%d", iteration, max_iterations)
 
-            yield AgentEvent.build("status", {"state": "complete", "detail": "Task finished successfully."})
+                try:
+                    # Determine current phase (Analyzing or Implementing)
+                    is_implementing = self._last_plan and self._last_plan.get("status") == "approved"
+                    status_state = "implementing" if is_implementing else "analyzing"
+                    status_prefix = "Implementing plan..." if is_implementing else "Thinking..."
+
+                    # Count and report current context tokens
+                    context_tokens, context_limit = self._count_context_tokens(messages, self._model)
+                    yield AgentEvent.build("status", {
+                        "state": status_state, 
+                        "detail": f"{status_prefix} (Context: {context_tokens}/{context_limit if context_limit else '??'} tokens)",
+                        "context_tokens": context_tokens,
+                        "context_limit": context_limit
+                    })
+
+
+                    api_key, api_base = self._get_credentials()
+                    temperature = _cfg(self._config, "llm", "temperature", default=0.2)
+                    max_tokens = _cfg(self._config, "llm", "max_tokens", default=4096)
+                    timeout = _cfg(self._config, "llm", "timeout_seconds", default=60)
+
+                    response = await asyncio.wait_for(
+                        litellm.acompletion(
+                            model=self._model,
+                            messages=messages,
+                            tools=tool_defs,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            api_key=api_key or None,
+                            api_base=api_base or None,
+                        ),
+                        timeout=timeout,
+                    )
+
+                    consecutive_errors = 0
+                    usage = usage_tracker.get_current_usage(response)
+                    usage_tracker.update(response)
+                    
+                    # Yield usage event for real-time cost tracking
+                    yield AgentEvent.build("usage", usage)
+                    
+                    choice = response.choices[0]
+                    assistant_msg = choice.message
+
+                    # Extract Thought from content (if any)
+                    thought_content = ""
+                    if assistant_msg.content:
+                        # Simple extraction of "Thought: ..." if present, or just use full content
+                        if "Thought:" in assistant_msg.content:
+                            thought_content = assistant_msg.content.split("Thought:")[1].split("Action:")[0].strip()
+                        else:
+                            thought_content = assistant_msg.content.strip()
+
+                    if thought_content:
+                        yield AgentEvent.build("thought", {"content": thought_content})
+
+                    if hasattr(assistant_msg, "tool_calls") and assistant_msg.tool_calls:
+                        messages.append(assistant_msg.model_dump())
+
+                        for tool_call in assistant_msg.tool_calls:
+                            if self._cancelled:
+                                break
+                            async for event in self._handle_tool_call(
+                                tool_call, messages, wait_for_command
+                            ):
+                                yield event
+                        continue
+
+                    if assistant_msg.content:
+                        # Log assistant message with metrics
+                        if self._current_session_id:
+                            add_message_record(
+                                self._current_session_id, 
+                                "assistant", 
+                                assistant_msg.content,
+                                prompt_tokens=usage["prompt_tokens"],
+                                completion_tokens=usage["completion_tokens"],
+                                cost=usage["cost"]
+                            )
+                        
+                        yield AgentEvent.build("message", {
+                            "content": assistant_msg.content,
+                            "usage": usage
+                        })
+                        messages.append({"role": "assistant", "content": assistant_msg.content})
+
+                    break
+
+                except asyncio.TimeoutError:
+                    consecutive_errors += 1
+                    logger.error("LLM call timed out (attempt %d/%d)", consecutive_errors, max_errors)
+                    yield AgentEvent.build("thought", {"content": f"LLM call timed out. Retrying... ({consecutive_errors}/{max_errors})"})
+                    if consecutive_errors >= max_errors:
+                        yield AgentEvent.build("error", {"detail": f"Agent halted: {max_errors} consecutive LLM timeouts."})
+                        break
+                    continue
+
+                except asyncio.CancelledError:
+                    raise
+
+                except Exception as exc:
+                    consecutive_errors += 1
+                    logger.error("Agent iteration %d failed: %s", iteration, exc)
+                    if consecutive_errors >= max_errors:
+                        yield AgentEvent.build("error", {"detail": f"Agent halted: {max_errors} consecutive errors. Last: {exc}"})
+                        break
+                    yield AgentEvent.build("thought", {"content": f"Encountered an error, retrying... ({consecutive_errors}/{max_errors})"})
+                    continue
+
+            if iteration >= max_iterations:
+                yield AgentEvent.build("thought", {"content": f"Reached maximum iteration limit ({max_iterations}). Stopping."})
+
+            yield AgentEvent.build("status", {"state": "complete", "detail": "Task finished."})
             yield AgentEvent.build("complete", {})
 
         except asyncio.CancelledError:
@@ -341,669 +382,426 @@ class CodeAgent:
         except Exception as exc:
             logger.exception("Agent error during run")
             yield AgentEvent.build("error", {"detail": f"Agent error: {exc}"})
-        # NOTE: WE NO LONGER DELETE REVIEW FILES IN FINALLY. 
-        # They persist for the user's reference.
 
-    # -----------------------------------------------------------------------
-    # File discovery
-    # -----------------------------------------------------------------------
+    def _recover_session_state(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        from .database import get_session_by_id
+        session_rec = get_session_by_id(session_id)
+        if not session_rec:
+            return
+        try:
+            self._pending_changes = json.loads(session_rec.pending_changes)
+            if session_rec.current_plan:
+                self._last_plan = json.loads(session_rec.current_plan)
+            logger.info("Recovered session state for %s (%d pending changes)", session_id, len(self._pending_changes))
+        except Exception as exc:
+            logger.warning("Failed to recover session state: %s", exc)
 
-    def _discover_files(self, user_message: str, workspace: Path) -> list[str]:
-        """Find relevant files in the workspace to read for context."""
-        files = []
-        if not workspace.exists():
-            return files
+    def _build_initial_messages(self, user_message: str) -> list[dict[str, Any]]:
+        system_prompt = _cfg(self._config, "system_prompt", default="You are an expert coding agent.")
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+        ]
 
-        # Collect all project files
-        all_files = []
-        for root, dirs, filenames in os.walk(workspace):
-            dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build"}]
-            for fname in filenames:
-                fpath = os.path.join(root, fname)
-                rel = os.path.relpath(fpath, workspace)
-                all_files.append(f"/{rel}")
+        if self._current_session_id:
+            history = self._get_conversation_history(self._current_session_id)
+            if history:
+                messages.extend(history)
 
-        # Extract keywords from user message
-        import re
-        keywords = set(re.findall(r"\w{3,}", user_message.lower()))
+        messages.append({"role": "user", "content": user_message})
         
-        # Score files based on keyword matches in path
-        scored_files = []
-        for f in all_files:
-            score = 0
-            f_lower = f.lower()
-            for kw in keywords:
-                if kw in f_lower:
-                    score += 1
+        # Log user message if session is active
+        if self._current_session_id:
+            add_message_record(self._current_session_id, "user", user_message)
             
-            # Prioritize source code
-            if f.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".html", ".md")):
-                score += 0.5
-            
-            scored_files.append((score, f))
+        return messages
 
-        # Sort by score (descending) then path
-        scored_files.sort(key=lambda x: (-x[0], x[1]))
-        
-        # Return top 15 most relevant files
-        return [f for score, f in scored_files[:15]]
-
-    # -----------------------------------------------------------------------
-    # Plan generation
-    # -----------------------------------------------------------------------
-
-    async def _generate_plan(
-        self,
-        user_message: str,
-        files: list[str],
-        file_contents: dict[str, str],
-        repo_context: str = ""
-    ) -> dict:
-        """Generate a plan payload using the Architect persona."""
-        if self._backend == "litellm":
-            plan = await self._generate_plan_litellm(user_message, files, file_contents, repo_context)
-        elif self._backend == "adk":
-            plan = await self._generate_plan_adk(user_message, files)
-        else:
-            raise ValueError("No valid LLM backend configured (need LITELLM_MODEL or GOOGLE_API_KEY)")
-
-        # Validation: Ensure plan has steps
-        if not plan.get("steps"):
-            logger.warning("Agent produced an empty plan.")
-            plan["steps"] = [{
-                "id": _uid(),
-                "description": "Examine the repository to clarify next steps",
-                "files": files[:2] if files else []
-            }]
-            plan["description"] = "I couldn't identify specific code changes yet. Let's start by exploring the context more deeply."
-
-        return plan
-
-    def _discover_files_with_researcher(self, user_message: str, repo_context: str) -> list[str]:
-        """
-        Mimic a Researcher role to select files to read based on the repository map.
-        Currently uses smart filtering, but could be upgraded to an LLM call.
-        """
-        import re
-        keywords = set(re.findall(r"\w{3,}", user_message.lower()))
-        
-        candidates = []
-        # Parse the repo_context (simple path list)
-        for line in repo_context.split("\n"):
-            if line.startswith("- "):
-                path = line.split(" ")[1]
-                score = 0
-                path_lower = path.lower()
-                for kw in keywords:
-                    if kw in path_lower:
-                        score += 2
-                
-                # Boost if path contains 'main', 'app', 'routes', 'api', etc.
-                if any(k in path_lower for k in ["main", "app", "api", "route", "service"]):
-                    score += 1
-                
-                candidates.append((score, path))
-        
-        candidates.sort(key=lambda x: (-x[0], x[1]))
-        return [c[1] for c in candidates[:15]]
-
-    # ── LiteLLM backend (GLM, Gemini, OpenAI, DeepSeek, Claude, etc.) ──
-
-    async def _generate_plan_litellm(
-        self,
-        user_message: str,
-        files: list[str],
-        file_contents: dict[str, str],
-        repo_context: str = ""
-    ) -> dict:
-        """Use the Architect persona to generate a plan via LiteLLM."""
+    def _count_context_tokens(self, messages: list[dict], model: str) -> tuple[int, int | None]:
+        """Count tokens in the current context window and return (current, max)."""
         try:
             import litellm
-
-            model_name = self._model
-            api_key = self._llm_settings.get("api_key") or os.getenv("LITELLM_API_KEY", "")
-            api_base = self._llm_settings.get("api_base") or os.getenv("LITELLM_API_BASE", "")
-            
-            # Context components
-            context_parts = []
-            for fpath in files:
-                content = file_contents.get(fpath, "")
-                if len(content) > 3000:
-                    content = content[:3000] + "\n... (truncated)"
-                context_parts.append(f"--- {fpath} ---\n{content}")
-
-            file_context = "\n\n".join(context_parts)
-
-            system_prompt = (
-                "You are the Architect role in an Antigravity-style agentic workflow.\n\n"
-                "Your objective is to design a high-level implementation plan based on research data. "
-                "You have been provided with a Repository Map (global view) and deep File Context (local view).\n\n"
-                "Rules:\n"
-                "- Produce your plan as JSON ONLY.\n"
-                '- Use the format: {"title": "...", "description": "...", "reasoning": "...", '
-                '"steps": [{"description": "...", "files": ["relative/path"]}]}\n'
-                "- Be precise. Do not guess file paths; use the ones provided in the repo map or context.\n"
-                "- Proactively include terminal verification steps (e.g., listing files, running tests, or checking for specific strings) to ensure the implementation is correct."
-            )
-
-            user_prompt = (
-                f"## Infrastructure Overview (Global Map)\n{repo_context}\n\n"
-                f"## Deep Research Findings (File Content)\n{file_context}\n\n"
-                f"## User Directive\n{user_message}"
-            )
-
-            logger.info("Calling LiteLLM with model: %s", model_name)
-
-            response = await litellm.acompletion(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                api_key=api_key or None,
-                api_base=api_base or None,
-                temperature=0.2,
-                max_tokens=2048,
-            )
-
-            raw = response.choices[0].message.content or ""
-            # Strip markdown code fences if present
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:].strip()
-
-            plan_dict = json.loads(cleaned)
-            steps = [
-                {
-                    "id": _uid(),
-                    "description": s["description"],
-                    "files": [f if not f.startswith("/") else f for f in s.get("files", [])],
-                }
-                for s in plan_dict.get("steps", [])
-            ]
-
-            return {
-                "id": _uid(),
-                "title": plan_dict.get("title", "Agent Plan"),
-                "description": plan_dict.get("description", ""),
-                "reasoning": plan_dict.get("reasoning", ""),
-                "steps": steps,
-            }
-        except Exception as exc:
-            logger.error("LiteLLM plan generation failed: %s", exc)
-            raise
-
-    # ── Google ADK backend (Gemini-only, legacy) ──
-
-    async def _generate_plan_adk(self, user_message: str, files: list[str]) -> dict:
-        """Use Google ADK to generate a plan (Gemini only)."""
-        try:
-            from google.adk import Runner, Agent  # type: ignore[import-untyped]
-            from google.adk.sessions import InMemorySessionService  # type: ignore[import-untyped]
-            from google.adk.runners import types  # type: ignore[import-untyped]
-
-            model_name = self._model or "gemini-2.0-flash"
-
-            agent = Agent(
-                name="plan_generator",
-                model=model_name,
-                instruction=(
-                    "You are a code planning assistant. Given a user request and a list of files, "
-                    "produce a JSON plan. Respond ONLY with JSON, no markdown.\n"
-                    'Format: {"title": "...", "description": "...", "reasoning": "...", '
-                    '"steps": [{"description": "...", "files": ["path1", "path2"]}]}'
-                ),
-            )
-
-            session_service = InMemorySessionService()
-            session_service.create_session_sync(app_name="plan_generator", user_id="user", session_id="plan")
-            runner = Runner(agent=agent, app_name="plan_generator", session_service=session_service)
-            full_text = ""
-            async for event in runner.run_async(
-                session_id="plan",
-                user_id="user",
-                new_message=types.Content(
-                    role="user",
-                    parts=[types.Part(text=f"Request: {user_message}\n\nFiles available:\n" + "\n".join(files))]
-                ),
-            ):
-                if event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if hasattr(part, "text") and part.text:
-                            full_text += part.text
-
-            raw = full_text
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-            plan_dict = json.loads(cleaned)
-            steps = [
-                {
-                    "id": _uid(),
-                    "description": s["description"],
-                    "files": s.get("files", []),
-                }
-                for s in plan_dict.get("steps", [])
-            ]
-
-            return {
-                "id": _uid(),
-                "title": plan_dict.get("title", "Agent Plan"),
-                "description": plan_dict.get("description", ""),
-                "reasoning": plan_dict.get("reasoning", ""),
-                "steps": steps,
-            }
-        except Exception as exc:
-            logger.error("ADK plan generation failed: %s", exc)
-            raise
-
-    # -----------------------------------------------------------------------
-    # LLM-powered file changes (uses LiteLLM to generate actual diffs)
-    # -----------------------------------------------------------------------
-
-    async def _generate_file_change(
-        self,
-        step_desc: str,
-        file_path: str,
-        original_content: str,
-        user_message: str,
-    ) -> str:
-        """Use LLM to generate modified file content for a change step."""
-        if self._backend == "litellm":
-            return await self._generate_change_litellm(step_desc, file_path, original_content, user_message)
-        elif self._backend == "adk":
-            return await self._generate_change_adk(step_desc, file_path, original_content, user_message)
-        else:
-            raise ValueError(f"No valid LLM backend configured for file generation (current: {self._backend})")
-
-    async def _generate_change_litellm(
-        self,
-        step_desc: str,
-        file_path: str,
-        original_content: str,
-        user_message: str,
-    ) -> str:
-        """Use LiteLLM to generate the modified file content."""
-        try:
-            import litellm
-
-            model_name = self._model
-            api_key = self._llm_settings.get("api_key") or os.getenv("LITELLM_API_KEY", "")
-            api_base = self._llm_settings.get("api_base") or os.getenv("LITELLM_API_BASE", "")
-            response = await asyncio.wait_for(
-                litellm.acompletion(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are the Implementer role in an Antigravity-style workflow.\n\n"
-                                "Your objective is to produce the COMPLETE modified content for a file "
-                                "based on a specific Architect-approved step. Do NOT output explanations or markdown fences — ONLY the raw file content.\n"
-                                "Ensure the file remains syntactically correct and exactly matches the architectural intent."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": (
-                                f"## Original Request\n{user_message}\n\n"
-                                f"## Change to Apply\n{step_desc}\n\n"
-                                f"## File: {file_path}\n```\n{original_content}\n```\n\n"
-                                "Return the complete modified file:"
-                            ),
-                        },
-                    ],
-                    api_key=api_key or None,
-                    api_base=api_base or None,
-                    temperature=0.1,
-                    max_tokens=4096,
-                ),
-                timeout=45
-            )
-            
-            modified = response.choices[0].message.content or ""
-            # Strip markdown code fences if present
-            modified = modified.strip()
-            if modified.startswith("```"):
-                modified = modified.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            # Remove common language identifiers (e.g., ```python)
-            lang_markers = {"python", "typescript", "javascript", "css", "html", "json"}
-            first_line = modified.split("\n")[0].lower()
-            if first_line in lang_markers:
-                modified = "\n".join(modified.split("\n")[1:]).strip()
-
-            return modified
-        except Exception as exc:
-            logger.warning("LiteLLM change generation failed: %s", exc)
-            return original_content + f"\n\n# Agent change: {step_desc}\n"
-
-    async def _generate_change_adk(
-        self,
-        step_desc: str,
-        file_path: str,
-        original_content: str,
-        user_message: str,
-    ) -> str:
-        """Use Google ADK to generate the modified file content."""
-        try:
-            from google.adk import Runner, Agent
-            from google.adk.sessions import InMemorySessionService
-            from google.adk.runners import types
-
-            model_name = self._model or "gemini-2.0-flash"
-            agent = Agent(
-                name="code_editor",
-                model=model_name,
-                instruction=(
-                    "You are a code editor. Return the COMPLETE modified file. No explanations, only code."
-                ),
-            )
-
-            session_service = InMemorySessionService()
-            session_service.create_session_sync(app_name="code_editor", user_id="user", session_id="edit")
-            runner = Runner(agent=agent, app_name="code_editor", session_service=session_service)
-            full_text = ""
-            # Wrap ADK run in timeout
+            current = litellm.token_counter(model=model, messages=messages)
             try:
-                gen = runner.run_async(
-                    session_id="edit",
-                    user_id="user",
-                    new_message=types.Content(
-                        role="user",
-                        parts=[types.Part(text=f"Apply change: {step_desc}\n\nFile: {file_path}\n```\n{original_content}\n```")]
-                    ),
-                )
-                async for event in asyncio.wait_for(gen, timeout=45):
-                    if event.content and event.content.parts:
-                        for part in event.content.parts:
-                            if hasattr(part, "text") and part.text:
-                                full_text += part.text
-            except asyncio.TimeoutError:
-                logger.error("ADK change generation timed out")
-                return original_content + f"\n\n# Error: Change generation timed out\n"
-
-            modified = full_text
-            if modified.startswith("```"):
-                modified = modified.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            return modified
-        except Exception as exc:
-            logger.warning("ADK change generation failed: %s", exc)
-            return original_content + f"\n\n# Agent change: {step_desc}\n"
-
-    async def _generate_terminal_command_litellm(
-        self,
-        step_desc: str,
-        files: list[str],
-        file_contents: dict[str, str],
-    ) -> str:
-        """Use the Implementer persona to generate a terminal command."""
-        try:
-            import litellm
-
-            model_name = self._model
-            api_key = self._llm_settings.get("api_key") or os.getenv("LITELLM_API_KEY", "")
-            api_base = self._llm_settings.get("api_base") or os.getenv("LITELLM_API_BASE", "")
-
-            system_prompt = (
-                "You are the Implementer role (Terminal Expert) in an Antigravity-style workflow.\n\n"
-                "Your objective is to produce a single, precise, and safe shell command to execute the Architect's plan step.\n\n"
-                "Rules:\n"
-                "- Output ONLY the raw shell command, no markdown fences, no explanation.\n"
-                "- Ensure the command is safe to run in a Linux environment.\n"
-                "- Use relative paths from the workspace root (no leading /)."
-            )
-
-            response = await asyncio.wait_for(
-                litellm.acompletion(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Step to execute: {step_desc}\nRelevant files: {', '.join(files)}"},
-                    ],
-                    api_key=api_key or None,
-                    api_base=api_base or None,
-                    temperature=0.1,
-                    max_tokens=256,
-                ),
-                timeout=30
-            )
-
-            cmd = response.choices[0].message.content or ""
-            return cmd.strip().strip("`")
-        except Exception as exc:
-            logger.error(f"Failed to generate terminal command via LLM: {exc}")
-            return self._infer_terminal_command(step_desc.lower(), files)
-
-    # -----------------------------------------------------------------------
-    # Step execution
-    # -----------------------------------------------------------------------
-
-    async def _determine_step_type(self, step_description: str) -> str:
-        """Categorize step into execution type using rules first, LLM as fallback."""
-        # 1. Rule-based pre-categorization (Anti-stall: no LLM call needed for common steps)
-        desc = step_description.lower()
-
-        # Read/View/Check steps → silent file read, no approval needed
-        if any(k in desc for k in (
-            "read", "explore", "analyze", "review", "open ", "look at",
-            "check", "verify", "confirm", "ensure", "inspect",
-            "view the", "contains correct", "validate content",
-        )):
-            return "file_read"
-
-        # Terminal/shell steps → generates command, needs approval
-        if any(k in desc for k in (
-            "run ", "test ", "execute", "command", "install",
-            "ls ", "git ", "pip ", "pytest", "script",
-            "validate results", "verify behavior", "print output",
-        )):
-            return "terminal_command"
-
-        # Write/create/modify steps → generates diff, needs approval
-        if any(k in desc for k in (
-            "write", "implement", "apply", "fix", "create",
-            "add", "modify", "delete", "remove", "update", "refactor",
-        )):
-            return "file_change"
-
-        # 2. LLM categorization as fallback
-        try:
-            import litellm
-            model_name = self._model
-            api_key = self._llm_settings.get("api_key") or os.getenv("LITELLM_API_KEY", "")
-            api_base = self._llm_settings.get("api_base") or os.getenv("LITELLM_API_BASE", "")
-
-            response = await asyncio.wait_for(
-                litellm.acompletion(
-                    model=model_name,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Categorize the following plan step into ONE of these types:\n"
-                                "1. 'file_read': Reading or analyzing existing files.\n"
-                                "2. 'terminal_command': Running shell commands (e.g. ls, pytest, pip, git, results check).\n"
-                                "3. 'file_change': Writing, modifying, or deleting code in a file.\n"
-                                "4. 'generic': High-level tasks, notes, or descriptions that don't need direct execution.\n\n"
-                                "Output ONLY the type name."
-                            )
-                        },
-                        {"role": "user", "content": step_description},
-                    ],
-                    api_key=api_key or None,
-                    api_base=api_base or None,
-                    temperature=0,
-                    max_tokens=20,
-                ),
-                timeout=30
-            )
-            return response.choices[0].message.content.strip().lower()
-        except Exception as e:
-            logger.error(f"Step type detection failed: {e}")
-            return "generic"
-
-    async def _execute_step(
-        self,
-        step: dict,
-        plan_id: str,
-        wait_for_command: AsyncGenerator[dict[str, Any], None],
-        file_contents: dict[str, str],
-    ) -> AsyncGenerator[AgentEvent, None]:
-        """Execute a single plan step and yield events."""
-        step_desc = step["description"]
-        step_files = step.get("files", [])
-        
-        # Determine step type via LLM
-        step_type = await self._determine_step_type(step_desc)
-        logger.info("Executing step '%s' as type '%s'", step_desc, step_type)
-
-        if step_type == "file_read":
-            # Read step — just emit file_read events
-            for fpath in step_files[:2]:
-                if self._cancelled:
-                    return
-                yield AgentEvent.build("file_read", {
-                    "path": fpath,
-                    "reason": step_desc,
-                })
-                await asyncio.sleep(0.2)
-
-        elif step_type == "terminal_command":
-            # Terminal command step — needs approval
-            if self._backend == "litellm":
-                cmd = await self._generate_terminal_command_litellm(step_desc, step_files, file_contents)
-            else:
-                cmd = self._infer_terminal_command(step_desc.lower(), step_files)
-            
-            cmd_id = _uid()
-
-            yield AgentEvent.build("terminal_command", {
-                "id": cmd_id,
-                "command": cmd,
-                "description": step_desc,
-                "working_dir": str(tools.get_workspace()),
-            })
-
-            approved = await self._wait_for_approval(
-                wait_for_command,
-                approve_type="approve_terminal",
-                reject_type="reject_terminal",
-                expected_id=cmd_id
-            )
- 
-            if approved:
-                yield AgentEvent.build("status", {"state": "running_terminal", "detail": f"Running: {cmd}"})
-                start = time.time()
-                result = await tools.run_terminal_command(cmd, timeout=30)
-                duration = (time.time() - start) * 1000
-
-                yield AgentEvent.build("terminal_output", {
-                    "command_id": cmd_id,
-                    "exit_code": result.data.get("exit_code", -1) if result.data else -1,
-                    "stdout": result.data.get("stdout", "") if result.data else "",
-                    "stderr": result.data.get("stderr", "") if result.data else "",
-                    "duration_ms": duration,
-                })
-            else:
-                yield AgentEvent.build("message", {"content": f"Skipped terminal command: {step_desc}"})
-
-        elif step_type == "file_change":
-            # File change step — needs approval
-            for fpath in step_files[:1]:
-                if self._cancelled:
-                    return
-
-                # Read original content
-                original = file_contents.get(fpath, "")
-                if not original:
-                    read_result = tools.read_file(fpath)
-                    if read_result.success and read_result.data:
-                        original = read_result.data.get("content", "")
-
-                # Use LLM to generate the modified content
-                modified = await self._generate_file_change(
-                    step_desc,
-                    fpath,
-                    original,
-                    "",  # user_message not needed here since step already describes the change
-                )
-
-                change_id = _uid()
-                change_payload = {
-                    "id": change_id,
-                    "path": fpath,
-                    "original": original,
-                    "modified": modified,
-                    "description": step_desc,
-                }
-                
-                # Track in agent memory
-                self._pending_changes.append(change_payload)
-                
-                # Sync to database
-                if session_id := getattr(self, "_current_session_id", None):
-                   update_session_state(session_id, pending_changes=self._pending_changes)
-                   # Force sync to UI
-                   yield AgentEvent.build("session_state", {
-                       "pending_changes": self._pending_changes
-                   })
-
-                yield AgentEvent.build("file_change", change_payload)
-
-                # Wait for user approval
-                approved = await self._wait_for_approval(
-                    wait_for_command,
-                    approve_type="accept_change",
-                    reject_type="reject_change",
-                    expected_id=change_id
-                )
-
-                if approved:
-                    write_result = tools.write_file(fpath, modified)
-                    if write_result.success:
-                        # Update file_contents cache
-                        file_contents[fpath] = modified
-                        yield AgentEvent.build("message", {"content": f"Applied: {step_desc}"})
-                    else:
-                        yield AgentEvent.build("error", {"detail": f"Failed to write: {write_result.error}"})
-                else:
-                    yield AgentEvent.build("message", {"content": f"Skipped change: {step_desc}"})
-
-                # Remove from pending changes and sync to DB
-                self._pending_changes = [c for c in self._pending_changes if c["id"] != change_id]
-                if session_id := getattr(self, "_current_session_id", None):
-                    update_session_state(session_id, pending_changes=self._pending_changes)
-                    # Force sync to UI
-                    yield AgentEvent.build("session_state", {
-                        "pending_changes": self._pending_changes
-                    })
-        else:
-            # Generic step
-            await asyncio.sleep(0.3)
-            yield AgentEvent.build("message", {"content": f"Completed: {step_desc}"})
-
-    # -----------------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------------
+                limit = litellm.get_max_tokens(model)
+            except Exception:
+                limit = None
+            return current, limit
+        except Exception:
+            return 0, None
 
     @staticmethod
-    def _infer_terminal_command(description: str, files: list[str]) -> str:
-        """Infer a terminal command from step description."""
-        desc_lower = description.lower()
-        if "test" in desc_lower:
-            return "python -m pytest tests/ -v"
-        if "install" in desc_lower or "pip" in desc_lower:
-            return "pip install -e ."
-        if "lint" in desc_lower or "ruff" in desc_lower:
-            return "ruff check ."
-        if "format" in desc_lower or "black" in desc_lower:
-            return "black ."
-        if "type" in desc_lower and "check" in desc_lower:
-            return "mypy ."
-        return f"echo 'Executing: {description}'"
+    def _get_conversation_history(session_id: str) -> list[dict[str, Any]]:
+        try:
+            db_messages = get_messages(session_id)
+            history = []
+            for m in db_messages[-20:]:
+                role = m.role if m.role in ("user", "assistant") else "user"
+                history.append({"role": role, "content": m.content})
+            return history
+        except Exception:
+            return []
+
+    async def _handle_tool_call(
+        self,
+        tool_call: Any,
+        messages: list[dict[str, Any]],
+        wait_for_command: AsyncGenerator[dict[str, Any], None],
+    ) -> AsyncGenerator[AgentEvent, None]:
+        tool_name = tool_call.function.name
+        try:
+            tool_args = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+        except json.JSONDecodeError:
+            tool_args = {}
+
+        logger.info("Tool call: %s(%s)", tool_name, json.dumps(tool_args)[:200])
+
+        yield AgentEvent.build("thought", {"content": f"Calling {tool_name}({self._summarize_args(tool_name, tool_args)})"})
+
+        if tool_name in TOOLS_REQUIRING_APPROVAL:
+            async for event in self._execute_gated_tool(tool_name, tool_args, tool_call.id, messages, wait_for_command):
+                yield event
+        else:
+            async for event in self._execute_safe_tool(tool_name, tool_args, tool_call.id, messages):
+                yield event
+
+    def _summarize_args(self, tool_name: str, args: dict) -> str:
+        if tool_name == "write_file":
+            path = args.get("path", "?")
+            content = args.get("content", "")
+            return f"path='{path}', content=<{len(content)} chars>"
+        if tool_name == "run_terminal":
+            return f"command='{args.get('command', '?')}'"
+        if tool_name == "read_file":
+            return f"path='{args.get('path', '?')}'"
+        if tool_name == "search_files":
+            return f"pattern='{args.get('pattern', '?')}'"
+        if tool_name == "propose_plan":
+            return f"title='{args.get('title', '?')}', steps={len(args.get('steps', []))}"
+        return json.dumps(args)[:100]
+
+    async def _execute_safe_tool(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        messages: list[dict[str, Any]],
+    ) -> AsyncGenerator[AgentEvent, None]:
+        yield AgentEvent.build("status", {"state": "analyzing", "detail": f"Running {tool_name}..."})
+
+        if tool_name == "read_file":
+            path = tool_args.get("path", "")
+            yield AgentEvent.build("file_read", {"path": path, "reason": "Agent reading file"})
+
+        # Heuristic: mark plan step as running
+        async for ev in self._update_step_status(tool_name, tool_args, "running"):
+            yield ev
+
+        result = execute_tool(tool_name, tool_args, self._config)
+        if inspect.isawaitable(result):
+            result = await result
+            
+        result_str = json.dumps(result, default=str)
+
+        if "error" in result:
+            logger.warning("Tool %s returned error: %s", tool_name, result["error"])
+            yield AgentEvent.build("thought", {"content": f"Tool {tool_name} error: {result['error']}"})
+
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": result_str,
+        })
+
+        # Heuristic: mark plan step as completed if safe tool succeeded
+        if "error" not in result:
+            async for ev in self._update_step_status(tool_name, tool_args, "completed"):
+                yield ev
+
+    async def _execute_gated_tool(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        messages: list[dict[str, Any]],
+        wait_for_command: AsyncGenerator[dict[str, Any], None],
+    ) -> AsyncGenerator[AgentEvent, None]:
+        if tool_name == "propose_plan":
+            async for event in self._handle_propose_plan(tool_args, tool_call_id, messages, wait_for_command):
+                yield event
+        elif tool_name == "write_file":
+            async for event in self._handle_write_file(tool_args, tool_call_id, messages, wait_for_command):
+                yield event
+        elif tool_name == "run_terminal":
+            async for event in self._handle_run_terminal(tool_args, tool_call_id, messages, wait_for_command):
+                yield event
+        elif tool_name == "ask_user":
+            async for event in self._handle_ask_user(tool_args, tool_call_id, messages, wait_for_command):
+                yield event
+        else:
+            result = {"error": f"Gated tool '{tool_name}' has no handler"}
+            messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(result)})
+
+    async def _handle_propose_plan(
+        self,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        messages: list[dict[str, Any]],
+        wait_for_command: AsyncGenerator[dict[str, Any], None],
+    ) -> AsyncGenerator[AgentEvent, None]:
+        plan = execute_tool("propose_plan", tool_args, self._config)
+        plan_id = _uid()
+        plan["id"] = plan_id
+
+        for step in plan.get("steps", []):
+            step["id"] = _uid()
+
+        plan["status"] = "pending"
+        self._last_plan = plan
+
+        yield AgentEvent.build("plan", plan)
+        if self._current_session_id:
+            update_session_state(self._current_session_id, current_plan=plan)
+
+        self._write_review_files(plan)
+
+        steps_summary = "\n".join([f"{i+1}. {s['description']}" for i, s in enumerate(plan.get("steps", []))])
+        yield AgentEvent.build("message", {
+            "content": f"### Proposed Plan: {plan['title']}\n{plan.get('description', '')}\n\n**Steps:**\n{steps_summary}\n\n*Review the details in `implementation_plan.md` and `task_list.md` before approving.*"
+        })
+        yield AgentEvent.build("status", {"state": "awaiting_plan_approval", "detail": "Plan generated. Waiting for your approval."})
+
+        approval_cfg = _cfg(self._config, "approval", default={})
+        approve_type = approval_cfg.get("plan_approval_event", "approve_plan")
+        reject_type = approval_cfg.get("plan_rejection_event", "reject_plan")
+
+        approval_cmd = await self._wait_for_approval(
+            wait_for_command, approve_type, reject_type, expected_id=plan_id
+        )
+
+        if not approval_cmd:
+            yield AgentEvent.build("thought", {"content": "Plan rejected."})
+            messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"status": "rejected"})})
+            self._persist_plan_decision(plan_id, "rejected")
+            return
+
+        payload = approval_cmd.get("payload", {})
+        task_md = payload.get("task_md", "")
+        if not task_md:
+            fr = tools.read_file("task_list.md")
+            if fr.success and fr.data:
+                task_md = fr.data.get("content", "")
+
+        if task_md:
+            revised_steps = self._parse_task_list_preserving_ids(task_md, plan.get("steps", []))
+            if revised_steps:
+                plan["steps"] = revised_steps
+
+        plan["status"] = "approved"
+        self._last_plan = plan
+
+        yield AgentEvent.build("plan_sync", {"id": plan["id"], "steps": plan["steps"]})
+        if self._current_session_id:
+            update_session_state(self._current_session_id, current_plan=plan)
+
+        self._persist_plan_decision(plan_id, "approved")
+
+        yield AgentEvent.build("thought", {"content": f"Plan approved! Executing {len(plan['steps'])} steps."})
+
+        steps_summary_text = "; ".join(s["description"] for s in plan["steps"])
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": json.dumps({"status": "approved", "steps_summary": steps_summary_text, "plan": plan}),
+        })
+
+    async def _handle_write_file(
+        self,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        messages: list[dict[str, Any]],
+        wait_for_command: AsyncGenerator[dict[str, Any], None],
+    ) -> AsyncGenerator[AgentEvent, None]:
+        fpath = tool_args.get("path", "")
+        content = tool_args.get("content", "")
+        description = tool_args.get("description", f"Write to {fpath}")
+
+        original = ""
+        read_result = tools.read_file(fpath)
+        if read_result.success and read_result.data:
+            original = read_result.data.get("content", "")
+
+        change_id = _uid()
+        change_payload = {
+            "id": change_id,
+            "path": fpath,
+            "original": original,
+            "modified": content,
+            "description": description,
+        }
+
+        self._pending_changes.append(change_payload)
+        if self._current_session_id:
+            update_session_state(self._current_session_id, pending_changes=self._pending_changes)
+            yield AgentEvent.build("session_state", {"pending_changes": self._pending_changes})
+
+        yield AgentEvent.build("status", {"state": "awaiting_change_approval", "detail": f"Proposing change to {fpath}"})
+        yield AgentEvent.build("file_change", change_payload)
+
+        approval_cfg = _cfg(self._config, "approval", default={})
+        approve_type = approval_cfg.get("change_approval_event", "accept_change")
+        reject_type = approval_cfg.get("change_rejection_event", "reject_change")
+
+        approval_cmd = await self._wait_for_approval(
+            wait_for_command, approve_type, reject_type, expected_id=change_id
+        )
+
+        if approval_cmd:
+            # Mark step as running
+            async for ev in self._update_step_status("write_file", tool_args, "running"):
+                yield ev
+
+            write_result = tools.write_file(fpath, content)
+            if write_result.success:
+                yield AgentEvent.build("message", {"content": f"Applied: {description}"})
+                tool_result = {"path": fpath, "written": True}
+                
+                # Mark step as completed
+                async for ev in self._update_step_status("write_file", tool_args, "completed"):
+                    yield ev
+            else:
+                yield AgentEvent.build("error", {"detail": f"Failed to write: {write_result.error}"})
+                tool_result = {"error": write_result.error}
+        else:
+            yield AgentEvent.build("message", {"content": f"Skipped: {description}"})
+            tool_result = {"path": fpath, "written": False, "reason": "User rejected"}
+
+        self._pending_changes = [c for c in self._pending_changes if c["id"] != change_id]
+        if self._current_session_id:
+            update_session_state(self._current_session_id, pending_changes=self._pending_changes)
+            yield AgentEvent.build("session_state", {"pending_changes": self._pending_changes})
+
+        messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(tool_result)})
+
+    async def _handle_run_terminal(
+        self,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        messages: list[dict[str, Any]],
+        wait_for_command: AsyncGenerator[dict[str, Any], None],
+    ) -> AsyncGenerator[AgentEvent, None]:
+        command = tool_args.get("command", "")
+        working_dir = tool_args.get("working_dir", "")
+        description = tool_args.get("description", f"Run: {command}")
+        default_timeout = _cfg(self._config, "tools", "terminal_default_timeout", default=120)
+        timeout = tool_args.get("timeout", default_timeout)
+
+        cmd_id = _uid()
+
+        yield AgentEvent.build("status", {"state": "awaiting_terminal_approval", "detail": f"Proposing: {command}"})
+        yield AgentEvent.build("terminal_command", {
+            "id": cmd_id,
+            "command": command,
+            "description": description,
+            "working_dir": working_dir or str(tools.get_workspace()),
+        })
+
+        approval_cfg = _cfg(self._config, "approval", default={})
+        approve_type = approval_cfg.get("terminal_approval_event", "approve_terminal")
+        reject_type = approval_cfg.get("terminal_rejection_event", "reject_terminal")
+
+        approval_cmd = await self._wait_for_approval(
+            wait_for_command, approve_type, reject_type, expected_id=cmd_id
+        )
+
+        if approval_cmd:
+            yield AgentEvent.build("status", {"state": "running_terminal", "detail": f"Running: {command}"})
+            
+            # Mark step as running
+            async for ev in self._update_step_status("run_terminal", tool_args, "running"):
+                yield ev
+                
+            start = time.time()
+            try:
+                cwd = tools._resolve(working_dir) if working_dir else tools.get_workspace()
+                self._active_proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(cwd),
+                )
+                
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(self._active_proc.communicate(), timeout=timeout)
+                    exit_code = self._active_proc.returncode
+                    stdout = stdout_bytes.decode("utf-8", errors="replace")
+                    stderr = stderr_bytes.decode("utf-8", errors="replace")
+                except asyncio.TimeoutError:
+                    if self._active_proc:
+                        self._active_proc.kill()
+                        await self._active_proc.wait()
+                    exit_code = -1
+                    stdout = ""
+                    stderr = f"Command timed out after {timeout}s"
+                except asyncio.CancelledError:
+                    if self._active_proc:
+                        self._active_proc.kill()
+                        await self._active_proc.wait()
+                    raise
+                finally:
+                    self._active_proc = None
+
+                duration = (time.time() - start) * 1000
+                
+                yield AgentEvent.build("terminal_output", {
+                    "command_id": cmd_id,
+                    "exit_code": exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "duration_ms": duration,
+                })
+                
+                tool_result = {
+                    "success": exit_code == 0,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": exit_code
+                }
+                
+                # Mark step as completed
+                if exit_code == 0:
+                    async for ev in self._update_step_status("run_terminal", tool_args, "completed"):
+                        yield ev
+                
+            except Exception as exc:
+                logger.error("Error running terminal command: %s", exc)
+                tool_result = {"error": str(exc)}
+                self._active_proc = None
+        else:
+            yield AgentEvent.build("message", {"content": f"Skipped terminal command: {description}"})
+            tool_result = {"command": command, "executed": False, "reason": "User rejected"}
+
+        messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps(tool_result, default=str)})
+
+    async def _handle_ask_user(
+        self,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        messages: list[dict[str, Any]],
+        wait_for_command: AsyncGenerator[dict[str, Any], None],
+    ) -> AsyncGenerator[AgentEvent, None]:
+        question = tool_args.get("question", "")
+        yield AgentEvent.build("message", {"content": f"**Question:** {question}"})
+        yield AgentEvent.build("status", {"state": "awaiting_change_approval", "detail": f"Waiting for user response: {question}"})
+
+        cmd = await self._wait_for_approval(wait_for_command, "chat", "cancel")
+        user_response = ""
+        if cmd:
+            user_response = cmd.get("payload", {}).get("message", "")
+        else:
+            user_response = "(no response)"
+
+        messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": json.dumps({"user_response": user_response})})
 
     @staticmethod
     async def _wait_for_approval(
@@ -1012,25 +810,15 @@ class CodeAgent:
         reject_type: str,
         expected_id: str | None = None,
     ) -> dict[str, Any] | None:
-        """Block until a command matching approve/reject type arrives.
-        
-        If expected_id is provided, it is matched against all common ID fields
-        (id, plan_id, change_id, command_id). Non-matching commands are re-queued
-        by simply continuing to consume, so they are NOT lost.
-        """
         async for cmd in wait_for_command:
             cmd_type = cmd.get("type", "")
             payload = cmd.get("payload", {})
 
-            logger.debug(
-                "_wait_for_approval: waiting=%s/%s, got=%s, payload=%s",
-                approve_type, reject_type, cmd_type, payload
-            )
+            logger.debug("_wait_for_approval: waiting=%s/%s, got=%s", approve_type, reject_type, cmd_type)
 
             if cmd_type == "cancel":
                 raise asyncio.CancelledError()
 
-            # If we need ID matching, extract it from all common ID fields
             if expected_id:
                 cmd_id = (
                     payload.get("id")
@@ -1039,10 +827,7 @@ class CodeAgent:
                     or payload.get("command_id")
                 )
                 if cmd_id and cmd_id != expected_id:
-                    logger.info(
-                        "Skipping command %s (id=%s), waiting for id=%s",
-                        cmd_type, cmd_id, expected_id
-                    )
+                    logger.info("Skipping command %s (id=%s), waiting for id=%s", cmd_type, cmd_id, expected_id)
                     continue
 
             if cmd_type == approve_type:
@@ -1051,25 +836,21 @@ class CodeAgent:
             if cmd_type == reject_type:
                 logger.info("Rejection RECEIVED: %s", reject_type)
                 return None
-            # Unknown command type — log and keep waiting
             logger.debug("Ignoring unrelated command %s while waiting for %s", cmd_type, approve_type)
 
         return None
 
     def _write_review_files(self, plan: dict) -> None:
-        """Write the implementation plan and task list to the workspace."""
-        # 1. Implementation Plan
         plan_md = [
             f"# Implementation Plan: {plan['title']}\n",
             f"{plan.get('description', '')}\n",
             "## Analysis & Reasoning\n",
             f"{plan.get('reasoning', '')}\n",
             "---",
-            f"**Note:** You can edit this file to add comments or context. To change the actual execution steps, edit `task_list.md` instead."
+            "**Note:** You can edit this file to add comments or context. To change the actual execution steps, edit `task_list.md` instead.",
         ]
         tools.write_file("implementation_plan.md", "\n".join(plan_md))
 
-        # 2. Task List
         task_md = [
             "# Task List\n",
             "Edit this checklist to modify the agent's work plan. Add or remove items to change what I do.\n",
@@ -1077,51 +858,30 @@ class CodeAgent:
         for step in plan.get("steps", []):
             files_str = f" ({', '.join(step['files'])})" if step.get("files") else ""
             task_md.append(f"- [ ] {step['description']}{files_str}")
-        
+
         tools.write_file("task_list.md", "\n".join(task_md))
 
-    @staticmethod
-    def _parse_task_list(md_content: str) -> list[dict] | None:
-        """Parse a markdown checklist back into Agent steps."""
-        steps = []
-        import re
-        # Look for lines starting with - [ ] or - [x]
-        lines = md_content.splitlines()
-        for line in lines:
-            # Handle both - [ ] and - [x] or * [ ] etc
-            match = re.match(r"^[-*]\s*\[[\sxX]\]\s*(.*)$", line.strip())
-            if match:
-                desc_line = match.group(1).strip()
-                if not desc_line:
-                    continue
-                
-                # Try to extract files in parentheses at the end
-                files = []
-                file_match = re.search(r"\(([^)]+)\)$", desc_line)
-                if file_match:
-                    files_raw = file_match.group(1)
-                    files = [f.strip() for f in files_raw.split(",")]
-                    description = desc_line[:file_match.start()].strip()
-                else:
-                    description = desc_line
-                
-                steps.append({
-                    "id": str(uuid.uuid4()),
-                    "description": description,
-                    "files": files,
-                    "status": "pending"
-                })
-        
-        return steps if steps else None
+    def _persist_plan_decision(self, plan_id: str, decision: str) -> None:
+        if not self._current_session_id:
+            return
+        try:
+            msgs = get_messages(self._current_session_id)
+            for m in reversed(msgs):
+                if m.role == "assistant" and m.payload:
+                    payload_data = json.loads(m.payload)
+                    if payload_data.get("id") == plan_id:
+                        payload_data["status"] = decision
+                        if m.id is not None:
+                            update_message_record(m.id, payload=payload_data)
+                        break
+        except Exception as exc:
+            logger.error("Failed to persist plan decision: %s", exc)
 
     @staticmethod
     def _parse_task_list_preserving_ids(
         md_content: str, original_steps: list[dict]
     ) -> list[dict] | None:
-        """Parse task list markdown, reusing original step IDs where descriptions match."""
-        import re
         steps = []
-        # Build a lookup of description → original step for ID reuse
         original_by_desc = {s["description"].strip().lower(): s for s in original_steps}
 
         for line in md_content.splitlines():
@@ -1141,7 +901,6 @@ class CodeAgent:
             else:
                 description = desc_line
 
-            # Reuse original step ID if description matches (for frontend sync)
             original = original_by_desc.get(description.strip().lower())
             step_id = original["id"] if original else str(uuid.uuid4())
 
@@ -1153,183 +912,65 @@ class CodeAgent:
             })
 
         return steps if steps else None
+    async def _update_step_status(self, tool_name: str, tool_args: dict, status: str) -> AsyncGenerator[AgentEvent, None]:
+        """Heuristic to update plan steps based on tool usage."""
+        if not self._last_plan:
+            return
 
-    # -----------------------------------------------------------------------
-    # Phase Executors
-    # -----------------------------------------------------------------------
-
-    async def _run_research_phase(self, user_message: str):
-        """Phase 1: Deep research and file discovery."""
-        yield AgentEvent.build("thought", {"content": "Starting research. Mapping repository structure to identify relevant areas."})
-        yield AgentEvent.build("status", {"state": "analyzing", "detail": "Researcher: Mapping repository structure..."})
-        
-        repo_map = tools.get_repository_map()
-        repo_context = ""
-        if repo_map.success:
-            repo_context = "\n".join([f"- {f['path']} ({f['hint']})" for f in repo_map.data["files"]])
-            if repo_map.data.get("truncated"):
-                repo_context += "\n... (large project, map truncated)"
-
-        yield AgentEvent.build("thought", {"content": "Analyzing repository map to discover files relevant to the request."})
-        yield AgentEvent.build("status", {"state": "analyzing", "detail": "Researcher: Identifying relevant source files..."})
-        files_to_read = self._discover_files_with_researcher(user_message, repo_context)
-
-        file_contents = {}
-        if files_to_read:
-            yield AgentEvent.build("thought", {"content": f"Identified {len(files_to_read)} files for examination: {', '.join(files_to_read)}. Initializing deep read."})
-        
-        for fpath in files_to_read:
-            if self._cancelled: break
-            yield AgentEvent.build("file_read", {"path": fpath, "reason": "Deep research"})
-            await asyncio.sleep(0.1) # Smooth UI
-            result = tools.read_file(fpath)
-            if result.success and result.data:
-                file_contents[fpath] = result.data.get("content", "")
-
-        self._last_repo_context = repo_context
-        self._last_file_contents = file_contents
-
-    async def _run_planning_phase(self, user_message: str, repo_context: str, file_contents: dict):
-        """Phase 2: Architectural planning."""
-        yield AgentEvent.build("thought", {"content": "Research complete. Acting as Architect to design a robust implementation strategy."})
-        yield AgentEvent.build("status", {"state": "planning", "detail": "Architect: Designing implementation plan..."})
-
-        # Convert file_contents map to list of paths for _generate_plan
-        paths = list(file_contents.keys())
-        plan = await self._generate_plan(user_message, paths, file_contents, repo_context)
-        self._last_plan = plan
-
-    async def _run_approval_phase(self, plan: dict, wait_for_command):
-        """Phase 3: Wait for user review and approval."""
-        yield AgentEvent.build("plan", plan)
-        if self._current_session_id:
-            update_session_state(self._current_session_id, current_plan=plan)
-        
-        # Write files for user to review in their own editor
-        self._write_review_files(plan)
-        
-        # Post summary to chat
-        steps_summary = "\n".join([f"{i+1}. {s['description']}" for i, s in enumerate(plan['steps'])])
-        yield AgentEvent.build("message", {
-            "content": f"### Proposed Plan: {plan['title']}\n{plan['description']}\n\n**Steps:**\n{steps_summary}\n\n*Review the details in `implementation_plan.md` and `task_list.md` before approving.*"
-        })
-        
-        yield AgentEvent.build("status", {"state": "awaiting_plan_approval", "detail": "Plan generated. Waiting for your approval in `implementation_plan.md`."})
-        yield AgentEvent.build("file_read", {"path": "implementation_plan.md", "reason": "Please review and approve the plan"})
-        
-        self._last_approval = await self._wait_for_approval(wait_for_command, "approve_plan", "reject_plan", expected_id=plan.get("id"))
-        
-        # Persist the decision in the historical record
-        if self._current_session_id:
-            try:
-                # Find the most recent assistant message with this plan ID in payload
-                msgs = get_messages(self._current_session_id)
-                for m in reversed(msgs):
-                    if m.role == 'assistant' and m.payload:
-                        payload_data = json.loads(m.payload)
-                        if payload_data.get('id') == plan.get('id'):
-                            # Update found message
-                            payload_data['status'] = 'approved' if self._last_approval else 'rejected'
-                            update_message_record(m.id, payload=payload_data)
-                            break
-            except Exception as e:
-                logger.error(f"Failed to update historical plan message: {e}")
-
-    async def _sync_approved_plan(self, original_plan: dict, approval_cmd: dict):
-        """Merge potential manual edits from the user into the execution plan."""
-        yield AgentEvent.build("thought", {"content": "Plan approved! Synchronizing final instructions."})
-        
-        payload = approval_cmd.get("payload", {})
-        task_md = payload.get("task_md", "")
-
-        original_plan["status"] = "approved"
-
-        # Fallback to reading from disk if memory sync is empty
-        if not task_md:
-            fr = tools.read_file("task_list.md")
-            if fr.success and fr.data:
-                task_md = fr.data.get("content", "")
-
-        if task_md:
-            # Parse but PRESERVE original step IDs by matching on description
-            revised_steps = self._parse_task_list_preserving_ids(
-                task_md, original_plan.get("steps", [])
-            )
-            if revised_steps:
-                original_plan["steps"] = revised_steps
-                yield AgentEvent.build("thought", {
-                    "content": f"Parsed {len(revised_steps)} steps. IDs preserved for UI sync."
-                })
-
-        # Always emit plan_sync so the frontend updates its step list with correct IDs
-        # This is a lightweight event that updates steps WITHOUT resetting approval status
-        yield AgentEvent.build("plan_sync", {
-            "id": original_plan["id"],
-            "steps": original_plan["steps"],
-        })
-        self._last_plan = original_plan
-        if self._current_session_id:
-            update_session_state(self._current_session_id, current_plan=original_plan)
-
-    async def _run_implementation_phase(self, plan: dict, wait_for_command, file_contents: dict):
-        """Phase 4: Gated implementation of plan steps."""
-        yield AgentEvent.build("status", {"state": "implementing", "detail": "Implementing approved plan..."})
-        yield AgentEvent.build("thought", {"content": "Implementation starting. I will propose changes step-by-step for your review."})
-
-        plan_id = plan["id"]
-        steps = plan["steps"]
-
-        for step in steps:
-            if self._cancelled: break
+        target_file = tool_args.get("path") or tool_args.get("working_dir")
+        if not target_file:
+            # If no path, try matching by command (for run_terminal)
+            target_file = tool_args.get("command")
+            if not target_file:
+                return
             
-            step_id = step["id"]
-            step_desc = step["description"]
-            
-            yield AgentEvent.build("thought", {"content": f"Next step: '{step_desc}'"})
-            
-            # Update step status in the plan object
-            step["status"] = "running"
-            if self._current_session_id:
-                update_session_state(self._current_session_id, current_plan=plan)
+        # Normalize target file (remove leading slashes, lowercase for broad matching)
+        target_norm = str(target_file).lstrip("/").lower()
 
+        plan_steps = self._last_plan.get("steps", [])
+        
+        # We want to find the first PENDING or RUNNING step that matches.
+        # This prevents an earlier completed step from "hoarding" the match.
+        matched_step = None
+        for step in plan_steps:
+            step_id = step.get("id")
+            
+            # Skip if this step is already completed and we are trying to mark a step as running
+            if step_id in self._completed_steps and status == "running":
+                continue
+                
+            # Match by filename in description or files list
+            match = False
+            files = [str(f).lstrip("/").lower() for f in step.get("files", [])]
+            desc = step.get("description", "").lower()
+            
+            # 1. Exact path match in files list
+            if target_norm in files:
+                match = True
+            # 2. File basename mentioned in description
+            elif any(f in target_norm or target_norm in f for f in files):
+                match = True
+            # 3. Path mentioned in description text
+            elif target_norm in desc:
+                match = True
+            
+            if match:
+                matched_step = step
+                # If we found a match that isn't completed yet, stop here.
+                # If it IS completed but we're marking it 'completed' again (idempotent), that's fine too.
+                if step_id not in self._completed_steps:
+                    break
+        
+        if matched_step:
+            step_id = matched_step.get("id")
+            if status == "completed":
+                self._completed_steps.add(step_id)
+            
+            logger.info("Plan matching: matched '%s' to step %s (%s)", target_norm, step_id, status)
             yield AgentEvent.build("step_update", {
                 "step_id": step_id,
-                "plan_id": plan_id,
-                "status": "running",
-                "detail": "Executing...",
+                "plan_id": self._last_plan.get("id", ""),
+                "status": status,
+                "detail": f"Agent {status} via {tool_name}"
             })
 
-            # Execute and YIELD all events (file changes, terminals)
-            try:
-                # We iterate over _execute_step and yield its events up to run()
-                async for event in self._execute_step(step, plan_id, wait_for_command, file_contents):
-                    if self._cancelled: return
-                    yield event
-                
-                # Step finished
-                step["status"] = "completed"
-                if self._current_session_id:
-                    update_session_state(self._current_session_id, current_plan=plan)
-
-                yield AgentEvent.build("step_update", {
-                    "step_id": step_id,
-                    "plan_id": plan_id,
-                    "status": "completed",
-                    "detail": "Step complete",
-                })
-                yield AgentEvent.build("step_update", {
-                    "step_id": step_id,
-                    "plan_id": plan_id,
-                    "status": "completed",
-                    "detail": "Step complete",
-                })
-            except Exception as e:
-                logger.error(f"Step {step_id} failed: {e}")
-                yield AgentEvent.build("step_update", {
-                    "step_id": step_id,
-                    "plan_id": plan_id,
-                    "status": "failed",
-                    "detail": str(e),
-                })
-                yield AgentEvent.build("message", {"content": f"Step failed: {step_desc}. Error: {e}"})
-                break

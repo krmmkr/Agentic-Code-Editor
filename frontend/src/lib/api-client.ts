@@ -46,6 +46,7 @@ export type AgentEventType =
   | 'terminal_output'  // Terminal command produced output
   | 'step_update'      // A plan step has started/completed/failed
   | 'error'            // Something went wrong
+  | 'usage'            // Token and cost usage for the session
   | 'complete';        // Agent finished its task
 
 export interface AgentEvent {
@@ -141,6 +142,15 @@ export interface AgentStepUpdateEvent {
   };
 }
 
+export interface AgentUsageEvent {
+  type: 'usage';
+  payload: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    cost: number;
+  };
+}
+
 export type AgentState =
   | 'idle'
   | 'connecting'
@@ -157,7 +167,7 @@ export type AgentState =
 // ── Frontend → Backend Commands ──────────────────────────
 
 export type ClientCommand =
-  | { type: 'chat'; payload: { message: string; session_id?: string | null; llm_settings?: { api_key?: string; model?: string } } }
+  | { type: 'chat'; payload: { message: string; session_id?: string | null; llm_settings?: { api_key?: string; model?: string; api_base?: string } } }
   | { type: 'approve_plan'; payload: { plan_id: string; plan?: any; plan_md?: string; task_md?: string } }
   | { type: 'reject_plan'; payload: { plan_id: string; reason?: string } }
   | { type: 'accept_change'; payload: { change_id: string } }

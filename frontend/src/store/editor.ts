@@ -43,6 +43,7 @@ interface EditorState {
   llmSettings: {
     apiKey: string;
     model: string;
+    apiBase: string;
   };
 
   // Tab actions
@@ -71,7 +72,7 @@ interface EditorState {
   // Chat actions
   addMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => void;
   clearChat: () => void;
-  setLLMSettings: (settings: { apiKey: string; model: string }) => void;
+  setLLMSettings: (settings: { apiKey: string; model: string; apiBase: string }) => void;
   closeSavedTabs: () => void;
 }
 
@@ -90,6 +91,7 @@ export const useEditor = create<EditorState>()(
       llmSettings: {
         apiKey: '',
         model: 'gemini/gemini-2.0-flash',
+        apiBase: '',
       },
 
       openFile: (path: string) => {
@@ -248,9 +250,11 @@ export const useEditor = create<EditorState>()(
       validateTabs: (existingPaths: string[]) => {
         set(state => {
           const validPaths = new Set(existingPaths);
-          const nextTabs = state.openTabs.filter(tab => 
-            tab === PLAN_TAB_ID || validPaths.has(tab.startsWith('/') ? tab.slice(1) : tab)
-          );
+          const nextTabs = state.openTabs.filter(tab => {
+            const isValid = tab === PLAN_TAB_ID || validPaths.has(tab.startsWith('/') ? tab.slice(1) : tab);
+            if (!isValid) console.debug(`[validateTabs] Closing invalid tab: ${tab}`);
+            return isValid;
+          });
           
           let nextActiveTab = state.activeTab;
           if (nextActiveTab && nextActiveTab !== PLAN_TAB_ID) {

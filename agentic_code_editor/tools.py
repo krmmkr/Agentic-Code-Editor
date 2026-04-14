@@ -8,11 +8,15 @@ cannot escape the project root.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import os
+import re
 import shutil
 import logging
+import yaml
 from pathlib import Path
-from typing import Any
+from typing import Any, List
+from .vector_db import get_vector_db
 
 from pydantic import BaseModel, Field
 
@@ -236,52 +240,215 @@ def get_repository_map() -> ToolResult:
     """
     Generate a concise map of the entire repository for agent context.
     Includes file paths and the first few lines of each text file for symbol hints.
+    Uses default hardcoded settings for backward compatibility with REST API.
+    """
+    return get_repository_map_configurable()
+
+
+def get_repository_map_configurable(
+    skip_dirs: set[str] | None = None,
+    extensions: set[str] | None = None,
+    max_files: int = 100,
+    snippet_lines: int = 5,
+    snippet_max_chars: int = 200,
+) -> ToolResult:
+    """
+    Generate a concise map of the entire repository for agent context.
+    All parameters are configurable via agent_config.yaml.
     """
     try:
         ws = get_workspace()
         files_map = []
-        
-        # Max files to map to prevent context explosion
-        MAX_FILES = 100
         count = 0
 
+        _skip = skip_dirs if skip_dirs is not None else {
+            ".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build",
+        }
+        _ext = extensions if extensions is not None else {
+            ".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".html", ".md",
+            ".json", ".yaml", ".toml",
+        }
+
         for root, dirs, filenames in os.walk(ws):
-            dirs[:] = [d for d in dirs if d not in {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build"}]
-            
+            dirs[:] = [d for d in dirs if d not in _skip]
+
             for fname in sorted(filenames):
-                if count >= MAX_FILES:
+                if count >= max_files:
                     break
-                
+
                 fpath = os.path.join(root, fname)
                 rel_path = os.path.relpath(fpath, ws)
-                
-                # Check extension
+
                 ext = Path(fpath).suffix.lower()
-                if ext not in {".py", ".ts", ".tsx", ".js", ".jsx", ".css", ".html", ".md", ".json", ".yaml", ".toml"}:
+                if ext not in _ext:
                     continue
 
                 snippet = ""
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         lines = []
-                        for _ in range(5): # Read first 5 lines for context
+                        for _ in range(snippet_lines):
                             line = f.readline().strip()
                             if line:
                                 lines.append(line)
-                        snippet = " | ".join(lines)[:200]
+                        snippet = " | ".join(lines)[:snippet_max_chars]
                 except Exception:
                     pass
 
                 files_map.append({
                     "path": rel_path,
                     "size": os.path.getsize(fpath),
-                    "hint": snippet
+                    "hint": snippet,
                 })
                 count += 1
-            
-            if count >= MAX_FILES:
+
+            if count >= max_files:
                 break
 
-        return ToolResult(success=True, data={"files": files_map, "truncated": count >= MAX_FILES})
+        return ToolResult(success=True, data={"files": files_map, "truncated": count >= max_files})
     except Exception as exc:
         return ToolResult(success=False, error=f"get_repository_map error: {exc}")
+
+
+def search_files(
+    pattern: str,
+    file_pattern: str = "",
+    max_results: int = 30,
+) -> ToolResult:
+    """
+    Search for a regex pattern across all text files in the workspace.
+    Returns matching file paths, line numbers, and matched lines.
+    """
+    try:
+        ws = get_workspace()
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            return ToolResult(success=False, error=f"Invalid regex pattern: {exc}")
+
+        matches: list[dict[str, Any]] = []
+        skip_dirs = {
+            ".git", "node_modules", "__pycache__", ".venv", "venv",
+            ".next", "dist", "build", "__pypackages__", ".mypy_cache",
+            ".pytest_cache", ".ruff_cache",
+        }
+
+        for root, dirs, filenames in os.walk(ws):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+
+            for fname in sorted(filenames):
+                if len(matches) >= max_results:
+                    break
+
+                fpath = os.path.join(root, fname)
+
+                if file_pattern and not fnmatch.fnmatch(fname, file_pattern):
+                    continue
+
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        for line_num, line in enumerate(f, 1):
+                            if regex.search(line):
+                                rel_path = os.path.relpath(fpath, ws)
+                                matches.append({
+                                    "path": rel_path,
+                                    "line": line_num,
+                                    "content": line.rstrip()[:500],
+                                })
+                                if len(matches) >= max_results:
+                                    break
+                except (PermissionError, OSError):
+                    continue
+
+            if len(matches) >= max_results:
+                break
+
+        return ToolResult(success=True, data={"pattern": pattern, "matches": matches, "truncated": len(matches) >= max_results})
+    except Exception as exc:
+        return ToolResult(success=False, error=f"search_files error: {exc}")
+
+
+async def semantic_search(query: str, limit: int = 5) -> ToolResult:
+    """Search for relevant code snippets using vector embeddings."""
+    try:
+        db = get_vector_db()
+        results = await db.search(query, limit=limit)
+        return ToolResult(success=True, data={"results": results})
+    except Exception as e:
+        return ToolResult(success=False, error=str(e))
+
+
+async def index_codebase(batch_size: int = 20) -> ToolResult:
+    """Index the entire workspace into the vector database."""
+    try:
+        from .database import get_setting
+        settings = get_setting("llm_settings", {})
+        api_key = settings.get("apiKey") or get_setting("llm_api_key") or os.getenv("LITELLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+        
+        if not api_key:
+            logger.warning("No API key found. Skipping codebase indexing until LLM is configured.")
+            return ToolResult(success=False, error="API key not configured. Please set your API key in the UI settings.")
+
+        db = get_vector_db()
+        db.clear()
+        
+        ws = get_workspace()
+        files_to_index = []
+        
+        # Simple walk to find files
+        for root, dirs, files in os.walk(ws):
+            # Skip hidden and ignored dirs
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('.git', 'node_modules', '__pycache__', 'venv', '.venv')]
+            
+            for file in sorted(files):
+                if file.endswith(('.py', '.js', '.ts', '.tsx', '.jsx', '.md', '.txt', '.go', '.rs')):
+                    files_to_index.append(Path(root) / file)
+
+        total_indexed = 0
+        current_batch = []
+        
+        for file_path in files_to_index:
+            try:
+                rel_path = str(file_path.relative_to(ws))
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Simple chunking by lines (approx 1500 chars as per config)
+                chunks = _chunk_text(content, chunk_size=1500, overlap=200)
+                for i, chunk in enumerate(chunks):
+                    current_batch.append({
+                        "id": f"{rel_path}_{i}",
+                        "path": rel_path,
+                        "content": chunk,
+                        "metadata": {"chunk_index": i}
+                    })
+                    
+                    if len(current_batch) >= batch_size:
+                        await db.add_documents(current_batch)
+                        total_indexed += len(current_batch)
+                        current_batch = []
+            except Exception as e:
+                logger.warning(f"Failed to index {file_path}: {e}")
+
+        if current_batch:
+            await db.add_documents(current_batch)
+            total_indexed += len(current_batch)
+
+        return ToolResult(success=True, data={"total_indexed_chunks": total_indexed})
+    except Exception as e:
+        logger.exception("Indexing failed")
+        return ToolResult(success=False, error=str(e))
+
+
+def _chunk_text(text: str, chunk_size: int = 1500, overlap: int = 200) -> List[str]:
+    """Helper to split text into overlapping chunks."""
+    if len(text) <= chunk_size:
+        return [text]
+    
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += (chunk_size - overlap)
+    return chunks

@@ -17,6 +17,7 @@ import { useState } from 'react';
 import { useFileSystem } from '@/store/file-system';
 import { useEditor, type DiffChange } from '@/store/editor';
 import { Button } from '@/components/ui/button';
+import { fetchApi } from '@/lib/api-client';
 import DiffView from './diff-view';
 import MarkdownPreview from './markdown-preview';
 
@@ -89,6 +90,67 @@ export default function CodeEditor() {
       const currentTab = activeTabRef.current;
       if (currentTab) saveFile(currentTab);
     });
+
+    // Register Autocomplete Provider (Global per language, only once)
+    const languages = ['typescript', 'javascript', 'python', 'json', 'css', 'html', 'markdown', 'yaml', 'shell', 'sql'];
+    
+    // @ts-ignore - store registration on monaco instance to prevent duplicates
+    if (!monaco._autocompleteRegistered) {
+      console.debug('Registering AI Inline Autocomplete Provider...');
+      languages.forEach(lang => {
+        monaco.languages.registerInlineCompletionsProvider(lang, {
+          provideInlineCompletions: async (model, position) => {
+            const currentTab = activeTabRef.current;
+            if (!currentTab) return { items: [] };
+            
+            const value = model.getValue();
+            const offset = model.getOffsetAt(position);
+            const prefix = value.substring(0, offset);
+            const suffix = value.substring(offset);
+
+            // Don't trigger if cursor is not at end of line or in middle of a word (simple heuristic)
+            const lineContent = model.getLineContent(position.lineNumber);
+            const afterCursor = lineContent.substring(position.column - 1);
+            if (afterCursor.trim().length > 0 && !afterCursor.startsWith(' ') && !afterCursor.startsWith(')') && !afterCursor.startsWith('}')) {
+               return { items: [] };
+            }
+
+            try {
+              const res = await fetchApi<{ completion: string }>('/api/autocomplete', {
+                method: 'POST',
+                body: JSON.stringify({
+                  path: currentTab,
+                  prefix,
+                  suffix
+                })
+              });
+
+              if (res && res.completion) {
+                return {
+                  items: [
+                    {
+                      insertText: res.completion,
+                      range: new monaco.Range(
+                        position.lineNumber,
+                        position.column,
+                        position.lineNumber,
+                        position.column
+                      ),
+                    }
+                  ]
+                };
+              }
+            } catch (err) {
+              console.warn('Inline Autocomplete failed:', err);
+            }
+            return { items: [] };
+          },
+          freeInlineCompletions: () => {}
+        });
+      });
+      // @ts-ignore
+      monaco._autocompleteRegistered = true;
+    }
   }, [saveFile]);
 
   const handleEditorChange = useCallback((value: string | undefined) => {

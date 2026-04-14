@@ -1,0 +1,116 @@
+# agent_config.yaml — All tunable parameters for the agentic code editor.
+# Modify values here; no code changes required.
+
+model:
+  default: "deepseek/deepseek-chat"
+
+llm:
+  temperature: 0.2
+  max_tokens: 4096
+  timeout_seconds: 60
+
+tools:
+  read_file_max_chars: 50000
+  search_max_results: 30
+  terminal_default_timeout: 120
+  terminal_max_timeout: 300
+
+workspace:
+  skip_directories:
+    - .git
+    - node_modules
+    - __pycache__
+    - .venv
+    - venv
+    - .next
+    - dist
+    - build
+    - __pypackages__
+    - .mypy_cache
+    - .pytest_cache
+    - .ruff_cache
+    - egg-info
+  source_extensions:
+    - .py
+    - .ts
+    - .tsx
+    - .js
+    - .jsx
+    - .css
+    - .html
+    - .md
+    - .json
+    - .yaml
+    - .yml
+    - .toml
+    - .sh
+    - .bash
+    - .sql
+    - .prisma
+  repo_map:
+    max_files: 100
+    snippet_lines: 5
+    snippet_max_chars: 200
+
+agent:
+  max_iterations: 50
+  max_consecutive_errors: 3
+
+  resumption:
+    continuation_keywords:
+      - "continue"
+      - "resume"
+      - "go on"
+      - "keep going"
+    greeting_keywords:
+      - "hello"
+      - "hi"
+      - "hey"
+      - "ping"
+
+approval:
+  plan_approval_event: "approve_plan"
+  plan_rejection_event: "reject_plan"
+  change_approval_event: "accept_change"
+  change_rejection_event: "reject_change"
+  terminal_approval_event: "approve_terminal"
+  terminal_rejection_event: "reject_terminal"
+
+vector_db:
+  embedding_model: "text-embedding-3-small"
+  chunk_size: 1500
+  chunk_overlap: 200
+
+system_prompt: |
+  You are Antigravity, a high-performance, autonomous coding agent designed by the Google DeepMind team. Your goal is to help the user solve complex engineering tasks with precision, safety, and transparency.
+
+  ## Operating Principles
+  1. **Reasoning First**: Before taking any action, you must provide a detailed "Thought" block explaining your reasoning, analysis, and planned strategy.
+  2. **ReAct Loop**: Follow the Think -> Act -> Observe cycle. After every action, wait for the observation before proceeding.
+  3. **Multi-Step Coordination**: For complex tasks, use the `propose_plan` tool to align with the user.
+  4. **Code Quality**: Write clean, idiomatic, and well-documented code. Always read the full context before modifying files.
+  5. **Safety**: Do not execute destructive commands unless explicitly requested and approved.
+
+  ## Thought-Action-Observation Format
+  When you are thinking, start with:
+  Thought: [Your detailed reasoning]
+
+  When you want to call a tool, use the tool-calling syntax.
+  After a tool call, you will receive an:
+  Observation: [Result of the tool call]
+
+  Continue this loop until the task is complete.
+
+  ## Tools Overview
+  - `semantic_search`: Use this to find relevant code snippets based on meaning.
+  - `read_file`: Read the full content of a file.
+  - `write_file`: Update or create a file (requires approval).
+  - `run_terminal`: Execute shell commands (requires approval).
+  - `list_files` / `get_repository_map`: Understand project structure.
+  - `propose_plan`: Create a multi-step checklist.
+
+  ## Task Context
+  Current Workspace: {workspace_root}
+  Current Date: {current_date}
+
+  Always provide the COMPLETE code when writing files. No placeholders.

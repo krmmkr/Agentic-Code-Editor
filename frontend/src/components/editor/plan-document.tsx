@@ -104,7 +104,7 @@ function StepCard({ step, index }: { step: PlanStep; index: number }) {
 
 export default function PlanDocument() {
   // Always read DIRECTLY from the store — no local state copy that can go stale
-  const { currentPlan } = useAgent();
+  const { currentPlan, agentState } = useAgent();
 
   if (!currentPlan) {
     return (
@@ -120,6 +120,10 @@ export default function PlanDocument() {
   const completedSteps = currentPlan.steps.filter(s => s.status === 'completed').length;
   const totalSteps = currentPlan.steps.length;
   const progress = totalSteps > 0 ? (completedSteps / totalSteps) * 100 : 0;
+  
+  // Decide whether to show the spinner based on agent state
+  const isExecuting = agentState === 'implementing' || agentState === 'running_terminal' || agentState === 'analyzing';
+  const showSpinner = isExecuting && progress < 100;
 
   return (
     <ScrollArea className="h-full">
@@ -196,21 +200,44 @@ export default function PlanDocument() {
           </div>
         </div>
 
-        {/* Progress bar — only shown during/after implementation */}
-        {isApproved && totalSteps > 0 && (
-          <div className="mb-6">
-            <div className="flex items-center justify-between text-[10px] text-muted-foreground mb-1.5">
-              <span>Progress</span>
-              <span>{completedSteps} / {totalSteps} steps</span>
+        {/* Progress bar — shown during and after implementation */}
+        {totalSteps > 0 && (isApproved || currentPlan.steps.some(s => s.status !== 'pending')) && (
+          <div className="mb-8 p-4 rounded-xl bg-accent/30 border border-border/50">
+            <div className="flex items-center justify-between text-[11px] font-medium text-muted-foreground mb-2">
+              <span className="flex items-center gap-2">
+                {progress === 100 ? (
+                  <CircleCheck className="h-3.5 w-3.5 text-emerald-500" />
+                ) : showSpinner ? (
+                  <Loader2 className="h-3.5 w-3.5 text-blue-400 animate-spin" />
+                ) : (
+                  <CircleCheck className={`h-3.5 w-3.5 ${progress > 0 ? 'text-amber-500' : 'text-muted-foreground'}`} />
+                )}
+                {progress === 100 
+                  ? 'Implementation Complete' 
+                  : showSpinner 
+                    ? 'Implementation in Progress' 
+                    : progress > 0 
+                      ? 'Implementation Halted' 
+                      : 'Implementation Pending'}
+              </span>
+              <span className="font-mono text-foreground">{completedSteps} / {totalSteps} steps</span>
             </div>
-            <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+            <div className="h-2 rounded-full bg-muted overflow-hidden relative">
               <div
-                className="h-full rounded-full bg-emerald-500 transition-all duration-500"
+                className="h-full rounded-full bg-emerald-500 transition-all duration-1000 shadow-[0_0_12px_rgba(16,185,129,0.3)]"
                 style={{ width: `${progress}%` }}
               />
+              {/* Subtle animated overlay for running state */}
+              {progress < 100 && (
+                <div 
+                  className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent w-20 animate-shimmer"
+                  style={{ left: `${progress}%` }}
+                />
+              )}
             </div>
           </div>
         )}
+
 
         {/* Implementation Steps — always reads live from store */}
         <div className="mb-8">

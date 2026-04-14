@@ -29,7 +29,10 @@ from typing import Any, Dict, List, Optional, Union
 
 import socketio
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+
+# Load environment variables early
+load_dotenv()
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -76,6 +79,12 @@ async def lifespan(app: FastAPI):
     
     logger.info("Initializing database...")
     init_db()
+    
+    # Auto-index the codebase in the background
+    logger.info("Starting initial codebase indexing...")
+    import asyncio
+    from agentic_code_editor.tools import index_codebase
+    asyncio.create_task(index_codebase())
     
     yield
     logger.info("Shutting down")
@@ -160,8 +169,18 @@ class BrowseResponse(BaseModel):
 
 
 class LLMVerifyRequest(BaseModel):
-    api_key: str | None = None
+    api_key: str | None = Field(None, alias="apiKey")
+    api_base: str | None = Field(None, alias="apiBase")
     model: str | None = None
+    
+    class Config:
+        populate_by_name = True
+
+
+class AutocompleteRequest(BaseModel):
+    path: str
+    prefix: str
+    suffix: str
 
 
 class SettingRequest(BaseModel):
@@ -313,7 +332,7 @@ async def get_current_workspace():
 @app.post("/llm/verify")
 async def verify_llm_endpoint(req: LLMVerifyRequest):
     """Test LLM credentials."""
-    return await CodeAgent.verify_credentials(req.api_key, req.model)
+    return await CodeAgent.verify_credentials(req.api_key, req.model, req.api_base)
 
 
 @app.post("/workspace")
@@ -409,9 +428,17 @@ async def get_setting_endpoint(key: str):
 
 
 @app.post("/settings")
-async def set_setting_endpoint(req: SettingRequest):
+async def set_setting_endpoint(req: SettingRequest, background_tasks: BackgroundTasks):
     """Set a global setting."""
     set_setting(req.key, req.value)
+    
+    # Auto-trigger indexing if LLM settings are updated
+    if req.key == 'llm_settings' and isinstance(req.value, dict):
+        if req.value.get('apiKey'):
+            logger.info("LLM settings updated with API key, triggering codebase indexing...")
+            from agentic_code_editor.tools import index_codebase
+            background_tasks.add_task(index_codebase)
+            
     return {"status": "success"}
 
 
@@ -449,6 +476,28 @@ async def delete_session_endpoint(session_id: str):
     """Delete a session."""
     delete_session_record(session_id)
     return {"status": "success"}
+
+
+@app.post("/api/autocomplete")
+async def autocomplete_endpoint(req: AutocompleteRequest):
+    """Provide intelligent code completion."""
+    settings = get_setting("llm_settings", {})
+    model = settings.get("model") or get_setting("llm_model") or os.getenv("LITELLM_MODEL") or "deepseek/deepseek-chat"
+    api_key = settings.get("apiKey") or get_setting("llm_api_key") or os.getenv("LITELLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_base = settings.get("apiBase") or get_setting("llm_api_base") or os.getenv("LITELLM_API_BASE")
+    
+    if not api_key:
+        logger.warning("Autocomplete skipped: No API key found in settings or environment")
+        return {"completion": ""}
+    completion = await CodeAgent.get_completion(
+        req.prefix, 
+        req.suffix, 
+        req.path, 
+        model, 
+        api_key=api_key, 
+        api_base=api_base
+    )
+    return {"completion": completion}
 
 
 # ---------------------------------------------------------------------------

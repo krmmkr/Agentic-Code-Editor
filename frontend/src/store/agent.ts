@@ -91,6 +91,7 @@ interface AgentStore {
   // Actions
   connect: () => void;
   disconnect: () => void;
+  refreshFileSystem: () => Promise<void>;
 
   // Send commands
   sendChat: (message: string) => void;
@@ -125,6 +126,12 @@ interface AgentStore {
   isConnecting: boolean;
   isCreatingSession: boolean;
   sessionsLoaded: boolean;
+  
+  // Metrics
+  currentSessionTokens: number;
+  currentSessionCost: number;
+  currentContextTokens: number;
+  maxContextTokens: number | null;
 }
 
 export const useAgent = create<AgentStore>((set, get) => ({
@@ -142,6 +149,10 @@ export const useAgent = create<AgentStore>((set, get) => ({
   activityLog: [],
   readFiles: [],
   currentThought: null,
+  currentSessionTokens: 0,
+  currentSessionCost: 0,
+  currentContextTokens: 0,
+  maxContextTokens: null,
 
   connect: () => {
     const { socket, isConnecting } = get();
@@ -189,24 +200,44 @@ export const useAgent = create<AgentStore>((set, get) => ({
         const workspacePath = useFileSystem.getState().currentWorkspacePath;
         if (!workspacePath) {
            console.warn('Workspace path not available during initialization.');
+           // If we have a saved session, we might still want to try loading it 
+           // but we really need the workspace path for the API.
            return;
         }
 
-        const sessions = await fetchApi<any[]>(`/sessions?workspace=${encodeURIComponent(workspacePath)}`);
+        const normalizedWs = workspacePath.replace(/\/$/, '');
+        const sessions = await fetchApi<any[]>(`/sessions?workspace=${encodeURIComponent(normalizedWs)}`);
         set({ sessions, sessionsLoaded: true });
         
         // Auto-load latest session or create new
         const savedSessionId = window.localStorage.getItem('current_session_id');
-        const sessionExists = sessions.find(s => s.id === savedSessionId);
         
-        if (sessionExists && sessionExists.workspace_path === workspacePath) {
-          await get().loadSession(savedSessionId!);
+        // Try to find the session in the filtered list first
+        let sessionToLoad = sessions.find(s => s.id === savedSessionId);
+        
+        // Fallback: If not found in filtered list but we HAVE a saved ID, 
+        // try to fetch it directly to see if it still exists (handles resolution mismatches)
+        if (!sessionToLoad && savedSessionId) {
+          try {
+            const directSession = await fetchApi<any>(`/sessions/${savedSessionId}`);
+            if (directSession && directSession.workspace_path.replace(/\/$/, '') === normalizedWs) {
+              sessionToLoad = directSession;
+              // Add to the local list so UI shows it
+              set(s => ({ sessions: [directSession, ...s.sessions.filter(x => x.id !== directSession.id)] }));
+            }
+          } catch (e) {
+            console.debug('Saved session not found on server:', savedSessionId);
+          }
+        }
+        
+        if (sessionToLoad) {
+          await get().loadSession(sessionToLoad.id);
         } else if (sessions.length > 0) {
           await get().loadSession(sessions[0].id);
         } else {
-          // Do not auto-create Session 1 here to allow completely empty state
           set({ currentSessionId: null });
         }
+
       } catch (err) {
         console.error('Failed to restore persistent session:', err);
       } finally {
@@ -221,22 +252,28 @@ export const useAgent = create<AgentStore>((set, get) => ({
     });
 
     newSocket.on('disconnect', () => {
-      set(s => ({
-        isConnected: false,
-        agentState: 'idle',
-        statusDetail: '',
-        currentThought: null,
-        // Reset any frozen "running" steps when connection drops
-        currentPlan: s.currentPlan ? {
-          ...s.currentPlan,
-          steps: s.currentPlan.steps.map(step =>
-            step.status === 'running'
-              ? { ...step, status: 'failed' as const, detail: 'Connection lost' }
-              : step
-          ),
-        } : null,
-      }));
-      get().addActivity('Agent disconnected', true);
+      set(s => {
+        const nextState = {
+          isConnected: false,
+          agentState: 'idle',
+          statusDetail: '',
+          currentThought: null,
+        } as Partial<AgentStore>;
+
+        // Preserve currentPlan but update step status if needed
+        if (s.currentPlan) {
+          nextState.currentPlan = {
+            ...s.currentPlan,
+            steps: s.currentPlan.steps.map(step =>
+              step.status === 'running'
+                ? { ...step, status: 'failed' as const, detail: 'Connection lost' }
+                : step
+            ),
+          };
+        }
+        return nextState;
+      });
+      get().addActivity('Agent disconnected (Attempting to reconnect...)', true);
     });
 
     // The unified event channel
@@ -369,7 +406,8 @@ export const useAgent = create<AgentStore>((set, get) => ({
         session_id: get().currentSessionId,
         llm_settings: {
           api_key: llmSettings.apiKey,
-          model: llmSettings.model
+          model: llmSettings.model,
+          api_base: llmSettings.apiBase
         }
       } 
     });
@@ -431,14 +469,28 @@ export const useAgent = create<AgentStore>((set, get) => ({
 
   toggleTerminal: () => set(s => ({ showTerminal: !s.showTerminal })),
   
+  refreshFileSystem: async () => {
+    try {
+      const fs = (await import('./file-system')).useFileSystem.getState();
+      await fs.refresh();
+    } catch (err) {
+      console.warn('Auto-refresh failed:', err);
+    }
+  },
+
   handleEvent: async (event: AgentEvent) => {
     const { type, payload } = event;
 
     switch (type) {
       case 'status': {
-        const { state, detail } = payload as { state: AgentState; detail?: string };
+        const { state, detail, context_tokens, context_limit } = payload as { state: AgentState; detail?: string; context_tokens?: number; context_limit?: number };
         const oldState = get().agentState;
-        set({ agentState: state, statusDetail: detail || '' });
+        set({ 
+          agentState: state, 
+          statusDetail: detail || '',
+          currentContextTokens: context_tokens || get().currentContextTokens,
+          maxContextTokens: context_limit || get().maxContextTokens
+        });
         if (detail) get().addActivity(detail, true);
         
         // Proactive file refresh if agent idles or completes
@@ -586,6 +638,11 @@ export const useAgent = create<AgentStore>((set, get) => ({
         const isWaitingApproval = get().agentState === 'awaiting_plan_approval' || get().agentState === 'awaiting_change_approval';
         set({ agentState: 'awaiting_change_approval', statusDetail: 'Review proposed changes...' });
         get().addActivity(`Proposed change: ${fc.path} — ${fc.description}`, true);
+        
+        // Proactively refresh if it's already accepted (happens in some internal tools)
+        if (get().agentState !== 'awaiting_change_approval') {
+          get().refreshFileSystem();
+        }
         break;
       }
 
@@ -646,6 +703,9 @@ export const useAgent = create<AgentStore>((set, get) => ({
             : null,
         }));
         get().updateSessionState();
+        if (su.status === 'completed') {
+           get().refreshFileSystem();
+        }
         break;
       }
 
@@ -659,6 +719,15 @@ export const useAgent = create<AgentStore>((set, get) => ({
         const { detail } = payload as { detail: string };
         set({ agentState: 'error', statusDetail: detail, currentThought: null });
         get().addActivity(`Error: ${detail}`, true);
+        break;
+      }
+      
+      case 'usage': {
+        const { prompt_tokens, completion_tokens, cost } = payload as { prompt_tokens: number; completion_tokens: number; cost: number };
+        set(s => ({
+          currentSessionTokens: s.currentSessionTokens + prompt_tokens + completion_tokens,
+          currentSessionCost: s.currentSessionCost + cost
+        }));
         break;
       }
     }
@@ -720,7 +789,9 @@ export const useAgent = create<AgentStore>((set, get) => ({
           timestamp: new Date(m.timestamp).getTime(),
           isStatus: false,
           payload: m.payload ? JSON.parse(m.payload) : undefined
-        }))
+        })),
+        currentSessionTokens: sessionData.total_tokens || 0,
+        currentSessionCost: sessionData.total_cost || 0,
       });
 
       // Active Plan Recovery:

@@ -35,6 +35,10 @@ class SessionBase(SQLModel):
     open_tabs: str = Field(default="[]")  # JSON list of strings
     pending_changes: str = Field(default="[]")  # JSON list of DiffChange objects
     current_plan: Optional[str] = Field(default=None)  # JSON string
+    
+    # Metrics
+    total_tokens: int = Field(default=0)
+    total_cost: float = Field(default=0.0)
 
 class SessionGroup(SessionBase, table=True):
     id: Optional[str] = Field(default=None, primary_key=True)
@@ -46,6 +50,11 @@ class MessageBase(SQLModel):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     session_id: str = Field(foreign_key="sessiongroup.id")
     payload: Optional[str] = None  # JSON serialized data (Plan, Command, etc.)
+    
+    # Metrics
+    prompt_tokens: int = Field(default=0)
+    completion_tokens: int = Field(default=0)
+    cost: float = Field(default=0.0)
 
 class Message(MessageBase, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -130,6 +139,18 @@ def migrate_message_payload_column():
                 logger.info("Successfully added 'payload' column.")
             else:
                 logger.debug("'payload' column already exists in 'message' table.")
+            
+            # Add metrics columns to message if missing
+            metrics_cols = {
+                "prompt_tokens": "INTEGER DEFAULT 0",
+                "completion_tokens": "INTEGER DEFAULT 0",
+                "cost": "REAL DEFAULT 0.0"
+            }
+            for col, col_def in metrics_cols.items():
+                if col not in columns:
+                    logger.info("Migrating schema: adding '%s' column to 'message' table...", col)
+                    connection.exec_driver_sql(f"ALTER TABLE message ADD COLUMN {col} {col_def};")
+                    connection.commit()
         except Exception as e:
             logger.error("Failed to migrate 'message' table schema: %s", e)
 
@@ -145,7 +166,9 @@ def migrate_session_columns():
             required_columns = {
                 "open_tabs": "TEXT DEFAULT '[]'",
                 "pending_changes": "TEXT DEFAULT '[]'",
-                "current_plan": "TEXT"
+                "current_plan": "TEXT",
+                "total_tokens": "INTEGER DEFAULT 0",
+                "total_cost": "REAL DEFAULT 0.0"
             }
             
             for col_name, col_type in required_columns.items():
@@ -229,17 +252,27 @@ def update_session_state(session_id: str, open_tabs: List[str] = None, pending_c
             session.refresh(db_session)
             return db_session
 
-def add_message_record(session_id: str, role: str, content: str, payload: any = None) -> Message:
+def add_message_record(session_id: str, role: str, content: str, payload: any = None, prompt_tokens: int = 0, completion_tokens: int = 0, cost: float = 0.0) -> Message:
     with Session(engine) as session:
         payload_str = json.dumps(payload) if payload is not None else None
-        db_message = Message(session_id=session_id, role=role, content=content, payload=payload_str)
+        db_message = Message(
+            session_id=session_id, 
+            role=role, 
+            content=content, 
+            payload=payload_str,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost=cost
+        )
         session.add(db_message)
         
-        # Update session timestamp
+        # Update session timestamp and aggregate metrics
         statement = select(SessionGroup).where(SessionGroup.id == session_id)
         db_session = session.exec(statement).one_or_none()
         if db_session:
             db_session.updated_at = datetime.utcnow()
+            db_session.total_tokens += (prompt_tokens + completion_tokens)
+            db_session.total_cost += cost
             session.add(db_session)
         
         session.commit()
